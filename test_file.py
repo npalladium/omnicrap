@@ -14,3 +14,4 @@ def complex_function(x):
 
 def simple_function():
     return 1
+// AI code
