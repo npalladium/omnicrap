@@ -272,11 +272,12 @@ fn is_bot(author: &str, email: &str, body: &str) -> bool {
             return true;
         }
         if line.starts_with("Co-Authored-By:") {
-            // Extract email from "Co-Authored-By: Name <email>"
+            // Extract value from "Co-Authored-By: Name <value>"
             if let (Some(lt), Some(gt)) = (line.rfind('<'), line.rfind('>')) {
                 if lt < gt {
-                    let coauthor_email = line[lt + 1..gt].to_lowercase();
-                    if is_bot_email(&coauthor_email) {
+                    let value = line[lt + 1..gt].to_lowercase();
+                    // value may be an email address OR a bare identity like "mybot[bot]"
+                    if is_bot_email(&value) || value.ends_with("[bot]") {
                         return true;
                     }
                 }
@@ -310,5 +311,9 @@ mod tests {
         // Human Co-Authored-By must not match
         assert!(!is_bot("bot-helper", "helper@example.com",
             "Co-Authored-By: Alice <alice@example.com>"));
+        // Co-Authored-By where the "email" is just name[bot] (no @ domain)
+        assert!(is_bot("some-author", "email@example.com",
+            "Co-Authored-By: mybot[bot] <mybot[bot]>"),
+            "Co-Authored-By with [bot]> suffix should be detected");
     }
 }
