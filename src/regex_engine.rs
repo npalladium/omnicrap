@@ -78,7 +78,7 @@ impl RegexEngine {
                 // Pop any scopes that dedented back to or past this level.
                 loop {
                     match stack.last() {
-                        Some((start_line, start_indent, _, _)) if indent <= *start_indent => {
+                        Some((_start_line, start_indent, _, _)) if indent <= *start_indent => {
                             let (start_line, _, name, kind) = stack.pop().unwrap();
                             if i + 1 > start_line {
                                 scopes.push((start_line, i, name, kind));
@@ -118,7 +118,7 @@ impl RegexEngine {
                 // Close scopes whose opening depth has been reached again.
                 loop {
                     match stack.last() {
-                        Some((start_line, _, _, open_depth)) if depth <= *open_depth => {
+                        Some((_start_line, _, _, open_depth)) if depth <= *open_depth => {
                             let (start_line, name, kind, _) = stack.pop().unwrap();
                             if i + 1 > start_line {
                                 scopes.push((start_line, i + 1, name, kind));

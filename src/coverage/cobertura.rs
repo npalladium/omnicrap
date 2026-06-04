@@ -51,6 +51,69 @@ struct CoberturaLine {
     hits: usize,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn write_tmp(content: &[u8]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn rejects_generic_xml() {
+        let tmp = write_tmp(b"<?xml version=\"1.0\"?>\n<report><data/></report>\n");
+        assert!(!CoberturaParser.can_parse(tmp.path()),
+            "generic XML without <coverage/<packages should not match");
+    }
+
+    #[test]
+    fn accepts_cobertura_xml() {
+        let tmp = write_tmp(b"<?xml version=\"1.0\"?>\n<!DOCTYPE coverage>\n<coverage><packages><package/></packages></coverage>\n");
+        assert!(CoberturaParser.can_parse(tmp.path()),
+            "valid cobertura XML should match on content");
+    }
+
+    #[test]
+    fn accepts_cobertura_by_path_fallback() {
+        // A file that contains neither marker but has "cobertura" in the path name
+        // still matches via path fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cobertura.xml");
+        std::fs::write(&p, b"<?xml?>\n<something/>\n").unwrap();
+        assert!(CoberturaParser.can_parse(&p),
+            "path containing 'cobertura' should match via path fallback");
+    }
+
+    #[test]
+    fn parses_line_coverage() {
+        let xml = br#"<?xml version="1.0"?>
+<coverage>
+  <packages>
+    <package>
+      <classes>
+        <class filename="src/lib.rs">
+          <lines>
+            <line number="1" hits="3"/>
+            <line number="2" hits="0"/>
+          </lines>
+        </class>
+      </classes>
+    </package>
+  </packages>
+</coverage>"#;
+        let tmp = write_tmp(xml);
+        let data = CoberturaParser.parse(tmp.path()).unwrap();
+        let cov = data.files.get("src/lib.rs").unwrap();
+        assert_eq!(*cov.get(&1).unwrap(), 3);
+        assert_eq!(*cov.get(&2).unwrap(), 0);
+    }
+}
+
 impl CoverageParser for CoberturaParser {
     fn name(&self) -> &str {
         "cobertura"
