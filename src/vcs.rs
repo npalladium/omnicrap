@@ -248,21 +248,52 @@ fn last_nonempty_line(s: &str) -> Option<String> {
 
 // Emails used by known AI coding assistants as Co-Authored-By identities.
 const KNOWN_AI_EMAILS: &[&str] = &[
-    "noreply@anthropic.com",   // Claude
-    "copilot@github.com",      // GitHub Copilot
-    "codeium@codeium.com",     // Codeium
+    "noreply@anthropic.com",          // Claude / Claude Code
+    "copilot@github.com",             // GitHub Copilot
+    "codeium@codeium.com",            // Codeium / Windsurf
+    "noreply@aider.chat",             // Aider
+    "cursoragent@cursor.com",         // Cursor AI
+    "gemini-cli-agent@google.com",    // Gemini CLI
+];
+
+// GitHub noreply slugs for AI tools that don't use the [bot] suffix convention.
+// Matches the "+<slug>@users.noreply.github.com" portion of numeric noreply addresses.
+const KNOWN_AI_GITHUB_SLUGS: &[&str] = &[
+    "+gemini-cli@",   // Gemini CLI GitHub identity
+    "+devin-ai@",     // Devin (Cognition AI)
+];
+
+// Author name substrings (matched case-insensitively) for tools whose commit
+// author name doesn't end with "[bot]" but is still clearly machine-generated.
+const KNOWN_AI_AUTHOR_SUBSTRINGS: &[&str] = &[
+    "gemini cli",   // Google Gemini CLI ("Gemini CLI bot", "gemini cli agent")
+    "devin-ai",     // Devin by Cognition AI
+    "(aider)",      // Aider with --attribute-author / --attribute-committer
+    "openhands",    // OpenHands (formerly OpenDevin)
 ];
 
 fn is_bot_email(email: &str) -> bool {
-    // GitHub bot noreply pattern: <id+name[bot]@users.noreply.github.com>
-    if email.ends_with("@users.noreply.github.com") && email.contains("[bot]") {
-        return true;
+    if email.ends_with("@users.noreply.github.com") {
+        // Standard GitHub bot: <id+name[bot]@users.noreply.github.com>
+        if email.contains("[bot]") {
+            return true;
+        }
+        // AI tools that use numeric noreply addresses without [bot]
+        if KNOWN_AI_GITHUB_SLUGS.iter().any(|&slug| email.contains(slug)) {
+            return true;
+        }
     }
     KNOWN_AI_EMAILS.iter().any(|&ai| email == ai)
 }
 
 fn is_bot(author: &str, email: &str, body: &str) -> bool {
-    if author.to_lowercase().ends_with("[bot]") {
+    let author_lower = author.to_lowercase();
+
+    if author_lower.ends_with("[bot]") {
+        return true;
+    }
+
+    if KNOWN_AI_AUTHOR_SUBSTRINGS.iter().any(|&s| author_lower.contains(s)) {
         return true;
     }
 
@@ -272,19 +303,24 @@ fn is_bot(author: &str, email: &str, body: &str) -> bool {
 
     for line in body.lines() {
         let line = line.trim();
-        if line.starts_with("Generated-By:") {
+        let line_lower = line.to_lowercase();
+
+        if line_lower.starts_with("generated-by:") {
             return true;
         }
-        if line.starts_with("Co-Authored-By:") {
-            // Extract value from "Co-Authored-By: Name <value>"
+        if line_lower.starts_with("co-authored-by:") {
+            // Standard format: Co-Authored-By: Name <email-or-identity>
             if let (Some(lt), Some(gt)) = (line.rfind('<'), line.rfind('>')) {
                 if lt < gt {
                     let value = line[lt + 1..gt].to_lowercase();
-                    // value may be an email address OR a bare identity like "mybot[bot]"
                     if is_bot_email(&value) || value.ends_with("[bot]") {
                         return true;
                     }
                 }
+            }
+            // Non-standard format (e.g. older Cursor): "Co-authored-by: Cursor cursoragent@cursor.com"
+            if KNOWN_AI_EMAILS.iter().any(|&e| line_lower.contains(e)) {
+                return true;
             }
         }
     }
@@ -297,14 +333,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_bot() {
+    fn test_is_bot_existing_patterns() {
         // Author name ends with [bot]
         assert!(is_bot("dependabot[bot]", "123+dependabot[bot]@users.noreply.github.com", ""));
         // GitHub bot via noreply email alone
         assert!(is_bot("Dependabot", "49699333+dependabot[bot]@users.noreply.github.com", ""));
-        // Generated-By trailer
+        // Generated-By trailer (original case)
         assert!(is_bot("some-author", "email@example.com", "Generated-By: AI"));
-        // Co-Authored-By with real GitHub bot email format (email ends with github.com, not [bot]>)
+        // generated-by trailer (lowercase — now accepted)
+        assert!(is_bot("some-author", "email@example.com", "generated-by: AI"));
+        // Co-Authored-By with real GitHub bot email format
         assert!(is_bot("some-author", "email@example.com",
             "Co-Authored-By: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"));
         // Co-Authored-By with known AI service email
@@ -319,6 +357,67 @@ mod tests {
         assert!(is_bot("some-author", "email@example.com",
             "Co-Authored-By: mybot[bot] <mybot[bot]>"),
             "Co-Authored-By with [bot]> suffix should be detected");
+    }
+
+    #[test]
+    fn test_is_bot_gemini_cli() {
+        // Author name substring
+        assert!(is_bot("Gemini CLI bot", "user@example.com", ""));
+        assert!(is_bot("gemini cli agent", "user@example.com", ""));
+        // GitHub numeric noreply without [bot]
+        assert!(is_bot("Gemini", "218195315+gemini-cli@users.noreply.github.com", ""));
+        // Known email
+        assert!(is_bot("Gemini CLI", "gemini-cli-agent@google.com", ""));
+        // Co-Authored-By trailer
+        assert!(is_bot("human", "human@example.com",
+            "Co-Authored-By: gemini-cli <gemini-cli-agent@google.com>"));
+    }
+
+    #[test]
+    fn test_is_bot_aider() {
+        // Standard aider Co-Authored-By format
+        assert!(is_bot("human", "human@example.com",
+            "Co-authored-by: aider (claude-3-5-sonnet) <noreply@aider.chat>"));
+        // Aider email directly
+        assert!(is_bot("human", "noreply@aider.chat", ""));
+        // Author name with (aider) suffix from --attribute-author
+        assert!(is_bot("Alice (aider)", "alice@example.com", ""));
+    }
+
+    #[test]
+    fn test_is_bot_cursor() {
+        // Standard format with angle brackets
+        assert!(is_bot("human", "human@example.com",
+            "Co-authored-by: Cursor <cursoragent@cursor.com>"));
+        // Non-standard format without angle brackets
+        assert!(is_bot("human", "human@example.com",
+            "Co-authored-by: Cursor cursoragent@cursor.com"));
+        // Email as author
+        assert!(is_bot("Cursor Agent", "cursoragent@cursor.com", ""));
+    }
+
+    #[test]
+    fn test_is_bot_devin() {
+        // Devin author name substring
+        assert!(is_bot("devin-ai", "devin@example.com", ""));
+        // Devin GitHub noreply
+        assert!(is_bot("Devin", "12345+devin-ai@users.noreply.github.com", ""));
+    }
+
+    #[test]
+    fn test_is_bot_openhands() {
+        assert!(is_bot("OpenHands Agent", "agent@example.com", ""));
+        assert!(is_bot("openhands-agent", "openhands@example.com", ""));
+    }
+
+    #[test]
+    fn test_is_bot_case_insensitive_trailer() {
+        // Co-authored-by (lowercase) must be detected
+        assert!(is_bot("human", "human@example.com",
+            "co-authored-by: Claude <noreply@anthropic.com>"));
+        // Mixed case
+        assert!(is_bot("human", "human@example.com",
+            "Co-Authored-By: Aider (gpt-4) <noreply@aider.chat>"));
     }
 
     #[test]
