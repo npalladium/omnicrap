@@ -6,10 +6,11 @@ use omni_crap::engine::LanguageEngine;
 use omni_crap::regex_engine::RegexEngine;
 use omni_crap::vcs::VcsData;
 use omni_crap::stats::StatsEngine;
-use omni_crap::{RiskReport, RiskProfile, MetricValue, calculate_hybrid_risk, truncate};
+use omni_crap::{RiskReport, RiskProfile, MetricValue, calculate_hybrid_risk};
 use omni_crap::sarif;
 
 use clap::Parser;
+use comfy_table::{Table, ContentArrangement, presets};
 use std::path::PathBuf;
 use std::fs;
 use std::process::Command;
@@ -18,83 +19,117 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Identify high-risk code via complexity, churn, and coverage analysis",
+    long_about = "omni-crap scores every function and method in your codebase using a hybrid \
+Z-score model that weighs structural complexity, process history (churn, author spread), \
+and stability signals (coverage, clones, AI-generated code).\n\n\
+The result is a ranked table of the riskiest scopes, so you know exactly where to focus \
+refactoring, review, and testing effort.",
+    after_help = "EXAMPLES:
+  omni-crap                                  Analyze current directory
+  omni-crap --coverage lcov.info             Include line-coverage data
+  omni-crap --format json > report.json      Machine-readable JSON output
+  omni-crap --coupling                       Change-coupling between files
+  omni-crap --stats                          Line-count roll-up per file
+  omni-crap --diff                           Only score changed files (fast CI use)
+  omni-crap --trend --since \"180 days\"     Flag rising complexity hotspots
+  omni-crap --crap --coverage lcov.info      Classical CRAP metric"
+)]
 struct Args {
-    /// Path to the coverage report (lcov.info or cobertura.xml)
-    #[arg(short, long)]
-    coverage: Option<PathBuf>,
-
-    /// The time window for calculating Git churn (e.g., "90 days")
-    #[arg(short, long, default_value = "90 days")]
-    since: String,
-
-    /// Minimum risk score to report (overrides config)
-    #[arg(short, long)]
-    threshold: Option<f64>,
-
-    /// Format of the output (table, json, sarif)
-    #[arg(short, long, default_value = "table")]
-    format: String,
-
-    /// Only show the Change Coupling report
-    #[arg(long, default_value_t = false)]
-    coupling: bool,
-
-    /// Calculate historical complexity trend (Rising Hotspots)
-    #[arg(long, default_value_t = false)]
-    trend: bool,
-
-    /// Show line count statistics roll-up table
-    #[arg(long, default_value_t = false)]
-    stats: bool,
-
-    /// Only analyze files changed in the current git diff (against HEAD)
-    #[arg(long, default_value_t = false)]
-    diff: bool,
-
-    /// Disable clone detection (faster)
-    #[arg(long, default_value_t = false)]
-    no_clones: bool,
-
-    /// Disable VCS analysis (churn, authors, coupling)
-    #[arg(long, default_value_t = false)]
-    no_vcs: bool,
-
-    /// Number of threads to use for analysis (0 = auto)
-    #[arg(short, long, default_value_t = 0)]
-    parallelism: usize,
-
     /// Target directory to analyze
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Use classical CRAP metric (complexity^2 * (1-coverage)^3 + complexity)
-    #[arg(long, default_value_t = false)]
-    crap: bool,
+    // ── Analysis ─────────────────────────────────────────────────────────────
 
-    /// Use Churn-weighted CRAP metric (CRAP * (1 + ln(churn + 1)))
-    #[arg(long, default_value_t = false)]
-    ccrap: bool,
+    /// Path to a coverage report (lcov.info or cobertura.xml)
+    #[arg(short, long, help_heading = "Analysis")]
+    coverage: Option<PathBuf>,
 
-    /// Use Hybrid Z-Score Risk model (default)
-    #[arg(long, default_value_t = false)]
-    zcrap: bool,
+    /// Git history window for churn calculation
+    #[arg(short, long, default_value = "90 days", help_heading = "Analysis")]
+    since: String,
 
-    /// Minimum number of tokens to consider a duplicate (overrides config)
-    #[arg(long)]
-    clone_min_tokens: Option<usize>,
+    /// Restrict analysis to files in the current git diff (staged, unstaged, and untracked)
+    #[arg(long, default_value_t = false, help_heading = "Analysis")]
+    diff: bool,
 
-    /// Enable deep per-scope VCS analysis (slower)
-    #[arg(long, default_value_t = false)]
+    /// Refine churn for top-N scopes using per-function git blame (slower)
+    #[arg(long, default_value_t = false, help_heading = "Analysis")]
     deep: bool,
 
-    /// Number of top-N scopes to analyze deeply
-    #[arg(long, default_value_t = 50)]
+    /// How many top-ranked scopes to refine when --deep is active
+    #[arg(long, default_value_t = 50, help_heading = "Analysis")]
     deep_top_n: usize,
 
-    /// Maximum file size to analyze in bytes (overrides config)
-    #[arg(long)]
+    /// Skip files larger than this many bytes
+    #[arg(long, help_heading = "Analysis")]
     max_file_size: Option<u64>,
+
+    // ── Output ────────────────────────────────────────────────────────────────
+
+    /// Output format: table, json, sarif
+    #[arg(short, long, default_value = "table", help_heading = "Output")]
+    format: String,
+
+    /// Hide scopes with a risk score below this value
+    #[arg(short, long, help_heading = "Output")]
+    threshold: Option<f64>,
+
+    /// Show the change-coupling report instead of the risk table
+    #[arg(long, default_value_t = false, help_heading = "Output")]
+    coupling: bool,
+
+    /// Show a line-count roll-up (lines, code, comments, blanks)
+    #[arg(long, default_value_t = false, help_heading = "Output")]
+    stats: bool,
+
+    /// Append a complexity-trend column (compares against 1 month ago)
+    #[arg(long, default_value_t = false, help_heading = "Output")]
+    trend: bool,
+
+    // ── Risk model ────────────────────────────────────────────────────────────
+
+    /// Classical CRAP: complexity² × (1 − coverage)³ + complexity
+    #[arg(long, default_value_t = false, help_heading = "Risk model")]
+    crap: bool,
+
+    /// Churn-weighted CRAP: CRAP × (1 + ln(churn + 1))
+    #[arg(long, default_value_t = false, help_heading = "Risk model")]
+    ccrap: bool,
+
+    /// Hybrid Z-score model combining structural, process, and stability signals (default)
+    #[arg(long, default_value_t = false, help_heading = "Risk model")]
+    zcrap: bool,
+
+    // ── Performance ──────────────────────────────────────────────────────────
+
+    /// Worker threads (0 = one per logical CPU)
+    #[arg(short, long, default_value_t = 0, help_heading = "Performance")]
+    parallelism: usize,
+
+    /// Skip VCS analysis (no churn, author count, or coupling data)
+    #[arg(long, default_value_t = false, help_heading = "Performance")]
+    no_vcs: bool,
+
+    /// Skip clone/duplicate detection
+    #[arg(long, default_value_t = false, help_heading = "Performance")]
+    no_clones: bool,
+
+    /// Minimum token run to flag as a duplicate (overrides config)
+    #[arg(long, help_heading = "Performance")]
+    clone_min_tokens: Option<usize>,
+}
+
+fn make_table() -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(presets::UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+    table
 }
 
 fn main() -> anyhow::Result<()> {
@@ -104,16 +139,13 @@ fn main() -> anyhow::Result<()> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.parallelism)
             .build_global()
-            .ok(); 
+            .ok();
     }
 
     let config = Config::load(&args.path)?;
     let threshold = args.threshold.unwrap_or(config.threshold);
     let min_tokens = args.clone_min_tokens.unwrap_or(config.clone.min_tokens);
     let max_file_size = args.max_file_size.unwrap_or(config.max_file_size);
-
-    use std::io::IsTerminal;
-    let _use_color = std::env::var("NO_COLOR").is_err() && std::io::stdout().is_terminal();
 
     let clone_store = if args.no_clones {
         None
@@ -138,17 +170,17 @@ fn main() -> anyhow::Result<()> {
 
     if args.coupling {
         if let Some(ref vcs) = vcs_data {
-            println!("{:<40} {:<40} {:<10} {:<10}", "File 1", "File 2", "Co-Changes", "Degree");
-            println!("{}", "-".repeat(105));
+            let mut table = make_table();
+            table.set_header(vec!["File 1", "File 2", "Co-Changes", "Degree"]);
             for c in vcs.couplings.iter().take(50) {
-                println!(
-                    "{:<40} {:<40} {:<10} {:<10.0}%",
-                    truncate(&c.file1, 38),
-                    truncate(&c.file2, 38),
-                    c.revisions,
-                    c.degree * 100.0
-                );
+                table.add_row(vec![
+                    c.file1.clone(),
+                    c.file2.clone(),
+                    c.revisions.to_string(),
+                    format!("{:.0}%", c.degree * 100.0),
+                ]);
             }
+            println!("{table}");
         } else {
             eprintln!("Error: --coupling requires VCS analysis. Do not use --no-vcs with --coupling.");
         }
@@ -169,7 +201,7 @@ fn main() -> anyhow::Result<()> {
                 changed_files.insert(line.trim().to_string());
             }
         }
-        
+
         let output = Command::new("git")
             .arg("diff")
             .arg("--cached")
@@ -354,7 +386,7 @@ fn main() -> anyhow::Result<()> {
                     let past_comp = *past_scope.metrics.get("complexity").unwrap_or(&0.0);
                     trend_delta = Some(complexity - past_comp);
                 } else {
-                    trend_delta = Some(complexity); 
+                    trend_delta = Some(complexity);
                 }
             }
 
@@ -411,39 +443,37 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.stats {
-        println!("{:<40} {:<10} {:<10} {:<10} {:<10}", "File", "Lines", "Code", "Comments", "Blanks");
-        println!("{}", "-".repeat(85));
+        let mut table = make_table();
+        table.set_header(vec!["File", "Lines", "Code", "Comments", "Blanks"]);
         let mut seen_files = HashSet::new();
-        let mut total_lines = 0;
-        let mut total_code = 0;
-        let mut total_comments = 0;
-        let mut total_blanks = 0;
+        let mut total_lines = 0usize;
+        let mut total_code = 0usize;
+        let mut total_comments = 0usize;
+        let mut total_blanks = 0usize;
 
         for r in &reports {
             if seen_files.insert(&r.file) {
-                println!(
-                    "{:<40} {:<10} {:<10} {:<10} {:<10}",
-                    truncate(&r.file, 38),
-                    r.loc.lines,
-                    r.loc.code,
-                    r.loc.comments,
-                    r.loc.blanks
-                );
+                table.add_row(vec![
+                    r.file.clone(),
+                    r.loc.lines.to_string(),
+                    r.loc.code.to_string(),
+                    r.loc.comments.to_string(),
+                    r.loc.blanks.to_string(),
+                ]);
                 total_lines += r.loc.lines;
                 total_code += r.loc.code;
                 total_comments += r.loc.comments;
                 total_blanks += r.loc.blanks;
             }
         }
-        println!("{}", "-".repeat(85));
-        println!(
-            "{:<40} {:<10} {:<10} {:<10} {:<10}",
-            "TOTAL",
-            total_lines,
-            total_code,
-            total_comments,
-            total_blanks
-        );
+        table.add_row(vec![
+            "TOTAL".to_string(),
+            total_lines.to_string(),
+            total_code.to_string(),
+            total_comments.to_string(),
+            total_blanks.to_string(),
+        ]);
+        println!("{table}");
         return Ok(());
     }
 
@@ -451,10 +481,10 @@ fn main() -> anyhow::Result<()> {
     if args.deep && vcs_data.is_some() && !args.crap {
         let vcs = vcs_data.as_ref().unwrap();
         let top_n = args.deep_top_n;
-        
+
         // Sort first to get top-N
         reports.sort_by(|a, b| b.risk_score.total_cmp(&a.risk_score));
-        
+
         let mut affected = false;
         for r in reports.iter_mut().take(top_n) {
             let scope_churn = vcs.get_scope_churn(&r.file, &r.name, &args.since, &args.path);
@@ -464,7 +494,7 @@ fn main() -> anyhow::Result<()> {
                 affected = true;
             }
         }
-        
+
         if affected {
             if args.ccrap {
                 for r in reports.iter_mut() {
@@ -488,13 +518,20 @@ fn main() -> anyhow::Result<()> {
         let sarif_log = sarif::create_sarif_log(&reports);
         println!("{}", serde_json::to_string_pretty(&sarif_log).unwrap());
     } else {
+        let mut table = make_table();
+
         if args.trend {
-            println!("{:<40} {:<30} {:<10} {:<8} {:<8} {:<10} {:<8} {:<10} {:<10} {:<10} {:<10}", "File", "Scope", "Kind", "Mocks", "Clone", "Comp", "Trend", "Struct", "Process", "Stable", risk_header);
-            println!("{}", "-".repeat(170));
+            table.set_header(vec![
+                "File", "Scope", "Kind", "Mocks", "Clone", "Comp", "Trend",
+                "Struct", "Process", "Stable", risk_header,
+            ]);
         } else {
-            println!("{:<40} {:<30} {:<10} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10}", "File", "Scope", "Kind", "Mocks", "Clone", "Comp", "Struct", "Process", "Stable", risk_header);
-            println!("{}", "-".repeat(160));
+            table.set_header(vec![
+                "File", "Scope", "Kind", "Mocks", "Clone", "Comp",
+                "Struct", "Process", "Stable", risk_header,
+            ]);
         }
+
         for r in reports.iter().take(100) {
             let risk_str = if args.crap || args.ccrap {
                 format!("{:.1}", r.risk_score)
@@ -515,36 +552,36 @@ fn main() -> anyhow::Result<()> {
                     Some(_) => "0.0".to_string(),
                     None => "-".to_string(),
                 };
-                println!(
-                    "{:<40} {:<30} {:<10} {:<8} {:<8} {:<10.1} {:<8} {:<10.1} {:<10.1} {:<10.1} {:<10}",
-                    truncate(&r.file, 38),
-                    truncate(&r.name, 28),
+                table.add_row(vec![
+                    r.file.clone(),
+                    r.name.clone(),
                     kind_str,
                     mock_str,
                     clone_str,
-                    r.complexity,
+                    format!("{:.1}", r.complexity),
                     trend_str,
-                    r.profile.structural.value,
-                    r.profile.process.value,
-                    r.profile.stability.value,
-                    risk_str
-                );
+                    format!("{:.1}", r.profile.structural.value),
+                    format!("{:.1}", r.profile.process.value),
+                    format!("{:.1}", r.profile.stability.value),
+                    risk_str,
+                ]);
             } else {
-                println!(
-                    "{:<40} {:<30} {:<10} {:<8} {:<8} {:<10.1} {:<10.1} {:<10.1} {:<10.1} {:<10}",
-                    truncate(&r.file, 38),
-                    truncate(&r.name, 28),
+                table.add_row(vec![
+                    r.file.clone(),
+                    r.name.clone(),
                     kind_str,
                     mock_str,
                     clone_str,
-                    r.complexity,
-                    r.profile.structural.value,
-                    r.profile.process.value,
-                    r.profile.stability.value,
-                    risk_str
-                );
+                    format!("{:.1}", r.complexity),
+                    format!("{:.1}", r.profile.structural.value),
+                    format!("{:.1}", r.profile.process.value),
+                    format!("{:.1}", r.profile.stability.value),
+                    risk_str,
+                ]);
             }
         }
+
+        println!("{table}");
     }
 
     Ok(())
