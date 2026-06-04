@@ -3,7 +3,6 @@ use serde::Serialize;
 
 const DRIVER_NAME: &str = "omni-crap";
 const DRIVER_VERSION: &str = "0.1.0";
-const DRIVER_INFO_URI: &str = "https://github.com/omni-crap/omni-crap";
 const RULE_ID: &str = "omni-crap/high-risk";
 const SARIF_VERSION: &str = "2.1.0";
 const SARIF_SCHEMA_URL: &str = "https://json.schemastore.org/sarif-2.1.0.json";
@@ -31,8 +30,8 @@ pub struct SarifTool {
 pub struct SarifDriver {
     pub name: &'static str,
     pub version: &'static str,
-    #[serde(rename = "informationUri")]
-    pub information_uri: &'static str,
+    #[serde(rename = "informationUri", skip_serializing_if = "Option::is_none")]
+    pub information_uri: Option<&'static str>,
     pub rules: Vec<SarifRule>,
 }
 
@@ -45,8 +44,8 @@ pub struct SarifRule {
     pub full_description: SarifText,
     #[serde(rename = "defaultConfiguration")]
     pub default_configuration: SarifLevel,
-    #[serde(rename = "helpUri")]
-    pub help_uri: &'static str,
+    #[serde(rename = "helpUri", skip_serializing_if = "Option::is_none")]
+    pub help_uri: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -125,7 +124,7 @@ fn build_driver() -> SarifDriver {
     SarifDriver {
         name: DRIVER_NAME,
         version: DRIVER_VERSION,
-        information_uri: DRIVER_INFO_URI,
+        information_uri: None,
         rules: vec![SarifRule {
             id: RULE_ID,
             short_description: SarifText {
@@ -136,7 +135,7 @@ fn build_driver() -> SarifDriver {
                        Items above the threshold are considered high risk and candidates for refactoring.",
             },
             default_configuration: SarifLevel { level: "warning" },
-            help_uri: DRIVER_INFO_URI,
+            help_uri: None,
         }],
     }
 }
@@ -189,4 +188,17 @@ fn build_result(report: &RiskReport) -> SarifResult {
 
 fn normalize_path(path_str: &str) -> String {
     path_str.replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn driver_omits_placeholder_uri() {
+        let log = create_sarif_log(&[]);
+        let json = serde_json::to_string(&log).unwrap();
+        assert!(!json.contains("omni-crap/omni-crap"),
+            "placeholder GitHub URL must not appear in SARIF output");
+    }
 }
