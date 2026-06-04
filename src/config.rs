@@ -132,6 +132,74 @@ impl Default for Config {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write_config(dir: &std::path::Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn loads_config_from_same_dir() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), ".omni-crap.toml", "threshold = 5.0\n");
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.threshold, 5.0);
+    }
+
+    #[test]
+    fn walks_up_to_parent() {
+        let dir = tempdir().unwrap();
+        // Config lives in root; load is called from a subdirectory.
+        write_config(dir.path(), ".omni-crap.toml", "threshold = 7.5\n");
+        let sub = dir.path().join("src").join("utils");
+        std::fs::create_dir_all(&sub).unwrap();
+        let cfg = Config::load(&sub).unwrap();
+        assert_eq!(cfg.threshold, 7.5);
+    }
+
+    #[test]
+    fn stops_at_git_root() {
+        let dir = tempdir().unwrap();
+        // Mark as git root — should NOT walk further up into tmp's parent.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        write_config(dir.path(), ".omni-crap.toml", "threshold = 3.0\n");
+        let sub = dir.path().join("deep").join("path");
+        std::fs::create_dir_all(&sub).unwrap();
+        let cfg = Config::load(&sub).unwrap();
+        assert_eq!(cfg.threshold, 3.0);
+    }
+
+    #[test]
+    fn old_name_fallback() {
+        let dir = tempdir().unwrap();
+        // Only the legacy name present — should still load.
+        write_config(dir.path(), ".omnicrap.toml", "threshold = 2.5\n");
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.threshold, 2.5);
+    }
+
+    #[test]
+    fn new_name_takes_precedence_over_old() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), ".omni-crap.toml", "threshold = 9.0\n");
+        write_config(dir.path(), ".omnicrap.toml", "threshold = 1.0\n");
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.threshold, 9.0);
+    }
+
+    #[test]
+    fn missing_config_returns_defaults() {
+        let dir = tempdir().unwrap();
+        // Create a .git dir so the walk stops here, no config file.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.threshold, 10.0); // default
+    }
+}
+
 impl Config {
     pub fn get_weights_for_path(&self, path: &str) -> RiskWeights {
         for ovr in &self.overrides {
