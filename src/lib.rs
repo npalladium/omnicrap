@@ -190,16 +190,24 @@ pub fn calculate_hybrid_risk(
         let z_red = d_red.z_score(r.redundancy) * r.weights.stability;
         let z_age = d_age.z_score(r.age_months) * r.weights.stability;
 
-        let structural = z_comp + z_hal + z_clone;
-        let process = z_churn + z_auth + z_scat;
-        let stability = z_red + z_age;
+        let raw_structural = z_comp + z_hal + z_clone;
+        let raw_process    = z_churn + z_auth + z_scat;
+        let raw_stability  = z_red + z_age;
+
+        if !raw_structural.is_finite() || !raw_process.is_finite() || !raw_stability.is_finite() {
+            eprintln!("DEGENERATE: non-finite risk axis in {}:{} — zeroing", r.file, r.name);
+        }
+
+        let structural = if raw_structural.is_finite() { raw_structural } else { 0.0 };
+        let process    = if raw_process.is_finite()    { raw_process    } else { 0.0 };
+        let stability  = if raw_stability.is_finite()  { raw_stability  } else { 0.0 };
 
         r.profile.structural = MetricValue { value: structural, z_score: structural, grain: "scope" };
-        r.profile.process = MetricValue { value: process, z_score: process, grain: "file" };
-        r.profile.stability = MetricValue { value: stability, z_score: stability, grain: "file" };
+        r.profile.process    = MetricValue { value: process,    z_score: process,    grain: "file"  };
+        r.profile.stability  = MetricValue { value: stability,  z_score: stability,  grain: "file"  };
 
         r.risk_score = (1.0 + structural) * (1.0 + process) / (1.0 + stability).max(0.1);
-        
+
         if !r.risk_score.is_finite() {
             r.risk_score = 0.0;
         }
@@ -228,6 +236,46 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::engine::ScopeKind;
+
+    fn stub_report(complexity: f64) -> RiskReport {
+        RiskReport {
+            file: "f.rs".into(), name: "s".into(),
+            kind: ScopeKind::Function, test_kind: None,
+            mock_count: 0, clone_ratio: 0.0, clone_matches: vec![],
+            start_line: 1, complexity, halstead: 0.0, redundancy: 0.0,
+            coverage: 0.0, churn: 0, authors: 0, scatter: 0.0,
+            agent_ratio: 0.0, age_months: 0.0, trend_delta: None,
+            risk_score: 0.0, percentile: 0.0,
+            profile: RiskProfile {
+                structural: MetricValue { value: 0.0, z_score: 0.0, grain: "scope" },
+                process:    MetricValue { value: 0.0, z_score: 0.0, grain: "file"  },
+                stability:  MetricValue { value: 0.0, z_score: 0.0, grain: "file"  },
+            },
+            advice: String::new(), engine: "test".into(),
+            loc: FileStats::default(), file_class: None,
+            weights: RiskWeights::default(),
+        }
+    }
+
+    #[test]
+    fn test_nan_complexity_does_not_propagate() {
+        let mut reports = vec![stub_report(f64::NAN)];
+        calculate_hybrid_risk(&mut reports, &Config::default());
+        let r = &reports[0];
+        assert!(r.risk_score.is_finite(),              "risk_score is NaN");
+        assert!(r.profile.structural.value.is_finite(), "structural is NaN");
+        assert!(r.profile.process.value.is_finite(),    "process is NaN");
+        assert!(r.profile.stability.value.is_finite(),  "stability is NaN");
+    }
+
+    #[test]
+    fn test_inf_complexity_does_not_propagate() {
+        let mut reports = vec![stub_report(f64::INFINITY)];
+        calculate_hybrid_risk(&mut reports, &Config::default());
+        let r = &reports[0];
+        assert!(r.risk_score.is_finite(),              "risk_score is Inf");
+        assert!(r.profile.structural.value.is_finite(), "structural is Inf");
+    }
 
     #[test]
     fn test_distribution() {
