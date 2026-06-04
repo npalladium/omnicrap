@@ -213,7 +213,7 @@ impl VcsData {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.lines().last().map(|s| s.to_string())
+        last_nonempty_line(&stdout)
     }
 
     pub fn get_scope_churn(&self, path: &str, scope_name: &str, since: &str, base_path: &std::path::Path) -> usize {
@@ -240,6 +240,10 @@ impl VcsData {
         }
         0
     }
+}
+
+fn last_nonempty_line(s: &str) -> Option<String> {
+    s.lines().filter(|l| !l.trim().is_empty()).last().map(|l| l.to_string())
 }
 
 // Emails used by known AI coding assistants as Co-Authored-By identities.
@@ -315,5 +319,24 @@ mod tests {
         assert!(is_bot("some-author", "email@example.com",
             "Co-Authored-By: mybot[bot] <mybot[bot]>"),
             "Co-Authored-By with [bot]> suffix should be detected");
+    }
+
+    #[test]
+    fn last_nonempty_line_ignores_trailing_blank() {
+        // git --name-only output ends with a trailing newline, producing an
+        // empty last element from .lines(). The helper must skip those.
+        assert_eq!(last_nonempty_line("old/path.rs\nnew/path.rs\n"),
+                   Some("new/path.rs".to_string()));
+    }
+
+    #[test]
+    fn last_nonempty_line_handles_blank_only() {
+        assert_eq!(last_nonempty_line("   \n\n"), None);
+    }
+
+    #[test]
+    fn last_nonempty_line_single_entry() {
+        assert_eq!(last_nonempty_line("src/lib.rs\n"),
+                   Some("src/lib.rs".to_string()));
     }
 }
