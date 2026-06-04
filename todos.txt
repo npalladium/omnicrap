@@ -1,9 +1,0 @@
- > 1. Fallback to lizard style extraction where tree-sitter is not available.
-   2. Clone cargo-crap locally and check if we can improve our metrics based on that.
-
-   3. See if per-language trait based system will improve the code.
-
-   4. See if we can "automate" any of the recipes/lessons from @software-design-xrays.org and maybe add them into our
-   metrics.
-
-   5. Check if we can switch to arborium instead
