@@ -187,3 +187,47 @@ pub struct CloneMatch {
     pub other_start: usize,
     pub my_start: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identical_tokens(n: usize) -> Vec<Token> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        (0..n).map(|i| {
+            let mut h = DefaultHasher::new();
+            i.hash(&mut h);
+            Token {
+                kind: "kw".to_string(),
+                content: format!("t{}", i),
+                line: i + 1,
+                is_structural: true,
+                hash: h.finish(),
+            }
+        }).collect()
+    }
+
+    #[test]
+    fn canonicalize_deterministic_regardless_of_registration_order() {
+        let toks = identical_tokens(10);
+
+        let s1 = CloneStore::new(5);
+        s1.register_tokens("a.rs", &toks);
+        s1.register_tokens("b.rs", &toks);
+        s1.canonicalize();
+        let (_, m1) = s1.get_matches("a.rs", &toks);
+
+        let s2 = CloneStore::new(5);
+        s2.register_tokens("b.rs", &toks);  // reversed order
+        s2.register_tokens("a.rs", &toks);
+        s2.canonicalize();
+        let (_, m2) = s2.get_matches("a.rs", &toks);
+
+        assert_eq!(
+            m1.iter().map(|m| m.other_file.as_str()).collect::<Vec<_>>(),
+            m2.iter().map(|m| m.other_file.as_str()).collect::<Vec<_>>(),
+            "clone canonical must be identical regardless of registration order"
+        );
+    }
+}

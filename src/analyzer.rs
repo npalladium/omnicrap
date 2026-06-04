@@ -62,7 +62,7 @@ impl LanguageEngine for TreeSitterEngine {
             "rust" => r#"[
                 (function_item name: (identifier) @name) @func
                 (impl_item type: (_) @name) @class
-                (trait_item name: (identifier) @name) @class
+                (trait_item name: (type_identifier) @name) @class
                 (struct_item name: (type_identifier) @name) @class
                 (enum_item name: (type_identifier) @name) @class
             ]"#,
@@ -134,7 +134,7 @@ impl LanguageEngine for TreeSitterEngine {
             "rust" => r#"[
                 (function_item name: (identifier) @name) @func
                 (impl_item type: (_) @name) @class
-                (trait_item name: (identifier) @name) @class
+                (trait_item name: (type_identifier) @name) @class
                 (struct_item name: (type_identifier) @name) @class
                 (enum_item name: (type_identifier) @name) @class
             ]"#,
@@ -541,6 +541,36 @@ impl TreeSitterEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ScopeKind;
+
+    #[test]
+    fn rust_impl_method_captured() {
+        let src = "impl Foo { fn bar(&self) -> u32 { 42 } }";
+        let engine = TreeSitterEngine::new(None);
+        let scopes = engine.analyze(std::path::Path::new("t.rs"), src).unwrap();
+        assert!(scopes.iter().any(|s| s.name == "bar" && s.kind == ScopeKind::Function),
+            "impl method must be captured; got: {:?}", scopes.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>());
+        assert!(scopes.iter().any(|s| s.name == "Foo" && s.kind == ScopeKind::Class),
+            "impl block must be captured as class; got: {:?}", scopes.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rust_trait_captured() {
+        let src = "trait Animal { fn sound(&self) -> String; }";
+        let engine = TreeSitterEngine::new(None);
+        let scopes = engine.analyze(std::path::Path::new("t.rs"), src).unwrap();
+        assert!(scopes.iter().any(|s| s.name == "Animal" && s.kind == ScopeKind::Class),
+            "trait must be captured as class; got: {:?}", scopes.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rust_struct_captured() {
+        let src = "struct Point { x: f64, y: f64 }";
+        let engine = TreeSitterEngine::new(None);
+        let scopes = engine.analyze(std::path::Path::new("t.rs"), src).unwrap();
+        assert!(scopes.iter().any(|s| s.name == "Point" && s.kind == ScopeKind::Class),
+            "struct must be captured as class; got: {:?}", scopes.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>());
+    }
 
     #[test]
     fn halstead_js_rename_invariant() {
