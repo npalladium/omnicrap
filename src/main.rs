@@ -77,6 +77,10 @@ struct Args {
     #[arg(short, long, default_value = "table", help_heading = "Output")]
     format: String,
 
+    /// Unicode table borders and color: always, auto, never
+    #[arg(long, default_value = "auto", help_heading = "Output")]
+    color: String,
+
     /// Hide scopes with a risk score below this value
     #[arg(short, long, help_heading = "Output")]
     threshold: Option<f64>,
@@ -130,16 +134,22 @@ struct Args {
     clone_min_tokens: Option<usize>,
 }
 
-fn make_table() -> Table {
+fn make_table(unicode: bool) -> Table {
     let mut table = Table::new();
+    let preset = if unicode { presets::UTF8_FULL } else { presets::ASCII_BORDERS_ONLY };
     table
-        .load_preset(presets::UTF8_FULL)
+        .load_preset(preset)
         .set_content_arrangement(ContentArrangement::Dynamic);
     table
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    use std::io::IsTerminal;
+    let is_tty = std::io::stdout().is_terminal();
+    let no_color = std::env::var_os("NO_COLOR").is_some();
+    let unicode = resolve_color(&args.color, no_color, is_tty);
 
     if args.parallelism > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -178,7 +188,7 @@ fn main() -> anyhow::Result<()> {
 
     if args.coupling {
         if let Some(ref vcs) = vcs_data {
-            let mut table = make_table();
+            let mut table = make_table(unicode);
             table.set_header(vec!["File 1", "File 2", "Co-Changes", "Degree"]);
             for c in vcs.couplings.iter().take(50) {
                 table.add_row(vec![
@@ -336,7 +346,7 @@ fn main() -> anyhow::Result<()> {
         if classified_log.is_empty() {
             println!("No generated or vendored files detected.");
         } else {
-            let mut table = make_table();
+            let mut table = make_table(unicode);
             table.set_header(vec!["File", "Type", "Action", "Signal", "Pattern"]);
             for (path, cls) in &classified_log {
                 let type_str = match cls.class {
@@ -536,7 +546,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.stats {
-        let mut table = make_table();
+        let mut table = make_table(unicode);
         table.set_header(vec!["File", "Lines", "Code", "Comments", "Blanks"]);
         let mut seen_files = HashSet::new();
         let mut total_lines    = 0usize;
@@ -613,7 +623,7 @@ fn main() -> anyhow::Result<()> {
         let sarif_log = sarif::create_sarif_log(&reports);
         println!("{}", serde_json::to_string_pretty(&sarif_log).unwrap());
     } else {
-        let mut table = make_table();
+        let mut table = make_table(unicode);
 
         // Build header row, inserting "Type" when flagged files are present.
         let mut headers: Vec<&str> = Vec::new();
@@ -677,5 +687,33 @@ fn main() -> anyhow::Result<()> {
 fn print_exclusion_summary(generated: usize, vendored: usize) {
     if generated > 0 || vendored > 0 {
         eprintln!("Skipped {} generated, {} vendored files.", generated, vendored);
+    }
+}
+
+fn resolve_color(flag: &str, no_color_env: bool, is_tty: bool) -> bool {
+    if no_color_env { return false; }
+    match flag {
+        "always" => true,
+        "never"  => false,
+        _        => is_tty,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_color_overrides_always() {
+        assert!(!resolve_color("always", true, true));
+    }
+    #[test]
+    fn auto_uses_tty() {
+        assert!(resolve_color("auto", false, true));
+        assert!(!resolve_color("auto", false, false));
+    }
+    #[test]
+    fn never_overrides_tty() {
+        assert!(!resolve_color("never", false, true));
     }
 }
