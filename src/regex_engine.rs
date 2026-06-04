@@ -1,9 +1,10 @@
 use std::path::Path;
 use anyhow::Result;
-use crate::engine::{LanguageEngine, ScopeInfo, ScopeKind};
+use crate::engine::{LanguageEngine, Metrics, ScopeInfo, ScopeKind};
 use crate::languages::LanguageDatabase;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// Extract `(ScopeKind, name)` from a `def`/`class` header line (indent-based languages).
 /// Returns `None` for control-flow lines (`if`, `for`, `while`, etc.).
@@ -43,20 +44,30 @@ fn extract_brace_scope(line: &str) -> Option<(ScopeKind, String)> {
     None
 }
 
-pub struct RegexEngine;
+pub struct RegexEngine {
+    complexity_cache: Mutex<HashMap<String, Vec<Regex>>>,
+}
 
 impl RegexEngine {
     pub fn new() -> Self {
-        Self
+        Self {
+            complexity_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     fn calculate_complexity_for_slice(&self, slice: &str, complexity_checks: &[String]) -> usize {
         let mut complexity = 1;
-        for check in complexity_checks {
-            let escaped = regex::escape(check);
-            if let Ok(re) = Regex::new(&escaped) {
-                complexity += re.find_iter(slice).count();
-            }
+        let regexes = {
+            let key = complexity_checks.join("\x00");
+            let mut cache = self.complexity_cache.lock().unwrap();
+            cache.entry(key).or_insert_with(|| {
+                complexity_checks.iter()
+                    .filter_map(|c| Regex::new(&regex::escape(c)).ok())
+                    .collect()
+            }).clone()
+        };
+        for re in &regexes {
+            complexity += re.find_iter(slice).count();
         }
         complexity
     }
@@ -202,28 +213,31 @@ impl LanguageEngine for RegexEngine {
         LanguageDatabase::get().get_by_extension(extension).is_some()
     }
 
-    fn analyze(&self, _path: &Path, content: &str) -> Result<Vec<ScopeInfo>> {
-        let extension = _path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    fn analyze(&self, path: &Path, content: &str) -> Result<Vec<ScopeInfo>> {
+        let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
         let lang = LanguageDatabase::get().get_by_extension(extension).unwrap();
-        
+
         let mut scopes = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
 
         // 1. Add Global Scope
-        let mut global_metrics = HashMap::new();
         let total_complexity = self.calculate_complexity_for_slice(content, &lang.complexitychecks);
-        global_metrics.insert("complexity".to_string(), total_complexity as f64);
-        
+        let metrics = Metrics {
+            complexity: total_complexity as f64,
+            halstead: 0.0,
+            redundancy: 0.0,
+        };
+
         scopes.push(ScopeInfo {
             name: "Global".to_string(),
             kind: ScopeKind::Module,
-            test_kind: None, 
+            test_kind: None,
             mock_count: 0,
             clone_ratio: 0.0,
             clone_matches: Vec::new(),
             start_line: 1,
             end_line: lines.len().max(1),
-            metrics: global_metrics,
+            metrics,
         });
 
         // 2. Add detected sub-scopes
@@ -232,8 +246,11 @@ impl LanguageEngine for RegexEngine {
             let slice = lines[start-1..end.min(lines.len())].join("\n");
             let complexity = self.calculate_complexity_for_slice(&slice, &lang.complexitychecks);
 
-            let mut metrics = HashMap::new();
-            metrics.insert("complexity".to_string(), complexity as f64);
+            let metrics = Metrics {
+                complexity: complexity as f64,
+                halstead: 0.0,
+                redundancy: 0.0,
+            };
 
             scopes.push(ScopeInfo {
                 name,

@@ -1,7 +1,7 @@
 use omni_crap::analyzer::TreeSitterEngine;
 use omni_crap::classifier::{FileClass, FileClassifier, Classification, read_head_bytes};
 use omni_crap::clone_engine::CloneStore;
-use omni_crap::config::{ClassAction, Config};
+use omni_crap::config::{ClassAction, Config, WeightMatchers};
 use omni_crap::coverage::{CoverageParser, lcov::LcovParser, cobertura::CoberturaParser};
 use omni_crap::engine::LanguageEngine;
 use omni_crap::regex_engine::RegexEngine;
@@ -73,9 +73,9 @@ struct Args {
 
     // ── Output ────────────────────────────────────────────────────────────────
 
-    /// Output format: table, json, sarif
+    /// Output format
     #[arg(short, long, default_value = "table", help_heading = "Output")]
-    format: String,
+    format: OutputFormat,
 
     /// Unicode table borders and color: always, auto, never
     #[arg(long, default_value = "auto", help_heading = "Output")]
@@ -134,6 +134,13 @@ struct Args {
     clone_min_tokens: Option<usize>,
 }
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Table,
+    Json,
+    Sarif,
+}
+
 fn make_table(unicode: bool) -> Table {
     let mut table = Table::new();
     let preset = if unicode { presets::UTF8_FULL } else { presets::ASCII_BORDERS_ONLY };
@@ -188,64 +195,18 @@ fn main() -> anyhow::Result<()> {
 
     if args.coupling {
         if let Some(ref vcs) = vcs_data {
-            let mut table = make_table(unicode);
-            table.set_header(vec!["File 1", "File 2", "Co-Changes", "Degree"]);
-            for c in vcs.couplings.iter().take(50) {
-                table.add_row(vec![
-                    c.file1.clone(),
-                    c.file2.clone(),
-                    c.revisions.to_string(),
-                    format!("{:.0}%", c.degree * 100.0),
-                ]);
-            }
-            println!("{table}");
+            render_coupling_table(vcs, unicode);
         } else {
             eprintln!("Error: --coupling requires VCS analysis. Do not use --no-vcs with --coupling.");
         }
         return Ok(());
     }
 
-    let mut changed_files = HashSet::new();
-    if args.diff {
-        let output = Command::new("git")
-            .arg("diff")
-            .arg("--name-only")
-            .arg("HEAD")
-            .current_dir(&args.path)
-            .output()?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                changed_files.insert(line.trim().to_string());
-            }
-        }
-
-        let output = Command::new("git")
-            .arg("diff")
-            .arg("--cached")
-            .arg("--name-only")
-            .current_dir(&args.path)
-            .output()?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                changed_files.insert(line.trim().to_string());
-            }
-        }
-
-        let output = Command::new("git")
-            .arg("ls-files")
-            .arg("--others")
-            .arg("--exclude-standard")
-            .current_dir(&args.path)
-            .output()?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                changed_files.insert(line.trim().to_string());
-            }
-        }
-    }
+    let changed_files = if args.diff {
+        collect_diff_files(&args.path)
+    } else {
+        HashSet::new()
+    };
 
     let coverage_parsers: Vec<Box<dyn CoverageParser>> = vec![
         Box::new(LcovParser),
@@ -343,30 +304,7 @@ fn main() -> anyhow::Result<()> {
 
     // Short-circuit: show generated/vendored report and exit.
     if args.generated_report {
-        if classified_log.is_empty() {
-            println!("No generated or vendored files detected.");
-        } else {
-            let mut table = make_table(unicode);
-            table.set_header(vec!["File", "Type", "Action", "Signal", "Pattern"]);
-            for (path, cls) in &classified_log {
-                let type_str = match cls.class {
-                    FileClass::Generated => "generated",
-                    FileClass::Vendored  => "vendored",
-                };
-                let action_str = match cls.action {
-                    ClassAction::Exclude => "exclude",
-                    ClassAction::Flag    => "flag",
-                };
-                table.add_row(vec![
-                    path.clone(),
-                    type_str.to_string(),
-                    action_str.to_string(),
-                    cls.reason.to_string(),
-                    cls.pattern.clone(),
-                ]);
-            }
-            println!("{table}");
-        }
+        render_generated_report(&classified_log, unicode);
         return Ok(());
     }
 
@@ -381,10 +319,17 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    let weight_matchers = Arc::new(WeightMatchers::build(&config));
+
+    // Read all file contents once
+    let file_contents: Vec<(std::path::PathBuf, String)> = files.par_iter().filter_map(|entry| {
+        let path = entry.path().to_path_buf();
+        fs::read_to_string(&path).ok().map(|content| (path, content))
+    }).collect();
+
     // Pass 1: Clone registration
     if let Some(ref store) = clone_store {
-        files.par_iter().for_each(|entry| {
-            let path = entry.path();
+        file_contents.par_iter().for_each(|(path, content)| {
             let relative_path = match path.strip_prefix(&args.path) {
                 Ok(p) => p.to_string_lossy().to_string(),
                 Err(_) => return,
@@ -392,19 +337,16 @@ fn main() -> anyhow::Result<()> {
             if config.ignore.iter().any(|i| relative_path.contains(i.as_str())) {
                 return;
             }
-            if let Ok(content) = fs::read_to_string(path) {
-                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                if let Some(engine) = engines.iter().find(|e| e.is_supported(ext)) {
-                    let _ = engine.register_clones(path, &content);
-                }
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(engine) = engines.iter().find(|e| e.is_supported(ext)) {
+                let _ = engine.register_clones(path, content);
             }
         });
         store.canonicalize();
     }
 
     // Pass 2: Analysis
-    let mut reports: Vec<RiskReport> = files.par_iter().flat_map(|entry| {
-        let path = entry.path();
+    let mut reports: Vec<RiskReport> = file_contents.par_iter().flat_map(|(path, content)| {
         let relative_path = match path.strip_prefix(&args.path) {
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => return Vec::new(),
@@ -422,11 +364,6 @@ fn main() -> anyhow::Result<()> {
         let engine = match engines.iter().find(|e| e.is_supported(ext)) {
             Some(e) => e,
             None => return Vec::new(),
-        };
-
-        let content = match fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
         };
 
         let scopes = match engine.analyze(path, &content) {
@@ -473,9 +410,9 @@ fn main() -> anyhow::Result<()> {
 
         let mut local_reports = Vec::new();
         for scope in scopes {
-            let complexity = *scope.metrics.get("complexity").unwrap_or(&0.0);
-            let halstead   = *scope.metrics.get("halstead").unwrap_or(&0.0);
-            let redundancy = *scope.metrics.get("redundancy").unwrap_or(&0.0);
+            let complexity = scope.metrics.complexity;
+            let halstead   = scope.metrics.halstead;
+            let redundancy = scope.metrics.redundancy;
 
             let scope_coverage = if let Some(ref cov) = coverage_data {
                 cov.get_function_coverage(&relative_path, scope.start_line, scope.end_line)
@@ -486,7 +423,7 @@ fn main() -> anyhow::Result<()> {
             let mut trend_delta = None;
             if let Some(ref past_s) = past_scopes {
                 if let Some(past_scope) = past_s.iter().find(|s| s.name == scope.name && s.kind == scope.kind) {
-                    let past_comp = *past_scope.metrics.get("complexity").unwrap_or(&0.0);
+                    let past_comp = past_scope.metrics.complexity;
                     trend_delta = Some(complexity - past_comp);
                 } else {
                     trend_delta = Some(complexity);
@@ -523,7 +460,7 @@ fn main() -> anyhow::Result<()> {
                 engine: engine.name().to_string(),
                 loc: file_stats.clone(),
                 file_class,
-                weights: config.get_weights_for_path(&relative_path),
+                weights: weight_matchers.resolve(&relative_path, &config.weights),
             };
             local_reports.push(report);
         }
@@ -614,74 +551,156 @@ fn main() -> anyhow::Result<()> {
     reports.retain(|r| r.risk_score >= threshold);
     reports.sort_by(|a, b| b.risk_score.total_cmp(&a.risk_score));
 
-    let risk_header = if args.crap { "CRAP" } else if args.ccrap { "CCRAP" } else { "Risk" };
-    let has_flagged = reports.iter().any(|r| r.file_class.is_some());
-
-    if args.format == "json" {
+    if args.format == OutputFormat::Json {
         println!("{}", serde_json::to_string_pretty(&reports).unwrap());
-    } else if args.format == "sarif" {
+    } else if args.format == OutputFormat::Sarif {
         let sarif_log = sarif::create_sarif_log(&reports);
         println!("{}", serde_json::to_string_pretty(&sarif_log).unwrap());
     } else {
-        let mut table = make_table(unicode);
-
-        // Build header row, inserting "Type" when flagged files are present.
-        let mut headers: Vec<&str> = Vec::new();
-        if has_flagged { headers.push("Type"); }
-        headers.extend_from_slice(&["File", "Scope", "Kind", "Mocks", "Clone", "Comp"]);
-        if args.trend { headers.push("Trend"); }
-        headers.extend_from_slice(&["Struct", "Process", "Stable", risk_header]);
-        table.set_header(headers);
-
-        for r in reports.iter().take(100) {
-            let risk_str = if args.crap || args.ccrap {
-                format!("{:.1}", r.risk_score)
-            } else {
-                format!("{:.2} (p{:.0})", r.risk_score, r.percentile * 100.0)
-            };
-            let mut kind_str = format!("{:?}", r.kind);
-            if let Some(tk) = r.test_kind {
-                kind_str = format!("{:?}({:?})", r.kind, tk);
-            }
-            let mock_str  = if r.mock_count > 0  { r.mock_count.to_string() }      else { "-".to_string() };
-            let clone_str = if r.clone_ratio > 0.0 { format!("{:.0}%", r.clone_ratio * 100.0) } else { "-".to_string() };
-            let trend_str = r.trend_delta.map(|d| {
-                if d > 0.0       { format!("+{:.1}", d) }
-                else if d < 0.0  { format!("{:.1}", d) }
-                else             { "0.0".to_string() }
-            });
-
-            let mut row: Vec<String> = Vec::new();
-            if has_flagged {
-                row.push(match r.file_class {
-                    Some(FileClass::Generated) => "gen".to_string(),
-                    Some(FileClass::Vendored)  => "vendor".to_string(),
-                    None => "-".to_string(),
-                });
-            }
-            row.push(r.file.clone());
-            row.push(r.name.clone());
-            row.push(kind_str);
-            row.push(mock_str);
-            row.push(clone_str);
-            row.push(format!("{:.1}", r.complexity));
-            if args.trend {
-                row.push(trend_str.unwrap_or_else(|| "-".to_string()));
-            }
-            row.push(format!("{:.1}", r.profile.structural.value));
-            row.push(format!("{:.1}", r.profile.process.value));
-            row.push(format!("{:.1}", r.profile.stability.value));
-            row.push(risk_str);
-
-            table.add_row(row);
-        }
-
-        println!("{table}");
+        render_table(&reports, &args, unicode);
     }
 
     print_exclusion_summary(gen_excluded, vendor_excluded);
 
     Ok(())
+}
+
+fn collect_diff_files(path: &std::path::Path) -> HashSet<String> {
+    let mut changed = HashSet::new();
+
+    let output = Command::new("git")
+        .arg("diff").arg("--name-only").arg("HEAD")
+        .current_dir(path).output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                changed.insert(line.trim().to_string());
+            }
+        }
+    }
+
+    let output = Command::new("git")
+        .arg("diff").arg("--cached").arg("--name-only")
+        .current_dir(path).output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                changed.insert(line.trim().to_string());
+            }
+        }
+    }
+
+    let output = Command::new("git")
+        .arg("ls-files").arg("--others").arg("--exclude-standard")
+        .current_dir(path).output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                changed.insert(line.trim().to_string());
+            }
+        }
+    }
+
+    changed
+}
+
+fn render_table(reports: &[RiskReport], args: &Args, unicode: bool) {
+    let risk_header = if args.crap { "CRAP" } else if args.ccrap { "CCRAP" } else { "Risk" };
+    let has_flagged = reports.iter().any(|r| r.file_class.is_some());
+
+    let mut table = make_table(unicode);
+    let mut headers: Vec<&str> = Vec::new();
+    if has_flagged { headers.push("Type"); }
+    headers.extend_from_slice(&["File", "Scope", "Kind", "Mocks", "Clone", "Comp"]);
+    if args.trend { headers.push("Trend"); }
+    headers.extend_from_slice(&["Struct", "Process", "Stable", risk_header]);
+    table.set_header(headers);
+
+    for r in reports.iter().take(100) {
+        let risk_str = if args.crap || args.ccrap {
+            format!("{:.1}", r.risk_score)
+        } else {
+            format!("{:.2} (p{:.0})", r.risk_score, r.percentile * 100.0)
+        };
+        let mut kind_str = format!("{:?}", r.kind);
+        if let Some(tk) = r.test_kind {
+            kind_str = format!("{:?}({:?})", r.kind, tk);
+        }
+        let mock_str  = if r.mock_count > 0  { r.mock_count.to_string() } else { "-".to_string() };
+        let clone_str = if r.clone_ratio > 0.0 { format!("{:.0}%", r.clone_ratio * 100.0) } else { "-".to_string() };
+        let trend_str = r.trend_delta.map(|d| {
+            if d > 0.0      { format!("+{:.1}", d) }
+            else if d < 0.0 { format!("{:.1}", d) }
+            else            { "0.0".to_string() }
+        });
+
+        let mut row: Vec<String> = Vec::new();
+        if has_flagged {
+            row.push(match r.file_class {
+                Some(FileClass::Generated) => "gen".to_string(),
+                Some(FileClass::Vendored)  => "vendor".to_string(),
+                None => "-".to_string(),
+            });
+        }
+        row.push(r.file.clone());
+        row.push(r.name.clone());
+        row.push(kind_str);
+        row.push(mock_str);
+        row.push(clone_str);
+        row.push(format!("{:.1}", r.complexity));
+        if args.trend {
+            row.push(trend_str.unwrap_or_else(|| "-".to_string()));
+        }
+        row.push(format!("{:.1}", r.profile.structural.value));
+        row.push(format!("{:.1}", r.profile.process.value));
+        row.push(format!("{:.1}", r.profile.stability.value));
+        row.push(risk_str);
+
+        table.add_row(row);
+    }
+
+    println!("{table}");
+}
+
+fn render_coupling_table(vcs: &VcsData, unicode: bool) {
+    let mut table = make_table(unicode);
+    table.set_header(vec!["File 1", "File 2", "Co-Changes", "Degree"]);
+    for c in vcs.couplings.iter().take(50) {
+        table.add_row(vec![
+            c.file1.clone(),
+            c.file2.clone(),
+            c.revisions.to_string(),
+            format!("{:.0}%", c.degree * 100.0),
+        ]);
+    }
+    println!("{table}");
+}
+
+fn render_generated_report(log: &[(String, Classification)], unicode: bool) {
+    if log.is_empty() {
+        println!("No generated or vendored files detected.");
+    } else {
+        let mut table = make_table(unicode);
+        table.set_header(vec!["File", "Type", "Action", "Signal", "Pattern"]);
+        for (path, cls) in log {
+            let type_str = match cls.class {
+                FileClass::Generated => "generated",
+                FileClass::Vendored  => "vendored",
+            };
+            let action_str = match cls.action {
+                ClassAction::Exclude => "exclude",
+                ClassAction::Flag    => "flag",
+            };
+            table.add_row(vec![
+                path.clone(),
+                type_str.to_string(),
+                action_str.to_string(),
+                cls.reason.to_string(),
+                cls.pattern.clone(),
+            ]);
+        }
+        println!("{table}");
+    }
 }
 
 fn print_exclusion_summary(generated: usize, vendored: usize) {

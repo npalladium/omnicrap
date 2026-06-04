@@ -179,20 +179,24 @@ pub fn calculate_hybrid_risk(
     let d_age = Distribution::new(&ages);
 
     for (i, r) in reports.iter_mut().enumerate() {
-        let z_comp = d_comp.z_score(weighted_complexities[i]) * r.weights.structural;
-        let z_hal = d_hal.z_score(r.halstead) * r.weights.structural;
-        let z_clone = d_clone.z_score(r.clone_ratio) * r.weights.structural;
-        
-        let z_churn = d_churn.z_score(r.churn as f64) * r.weights.process;
-        let z_auth = d_auth.z_score(r.authors as f64) * r.weights.process;
-        let z_scat = d_scat.z_score(r.scatter) * r.weights.process;
+        let uz_comp  = d_comp.z_score(weighted_complexities[i]);
+        let uz_hal   = d_hal.z_score(r.halstead);
+        let uz_clone = d_clone.z_score(r.clone_ratio);
 
-        let z_red = d_red.z_score(r.redundancy) * r.weights.stability;
-        let z_age = d_age.z_score(r.age_months) * r.weights.stability;
+        let uz_churn = d_churn.z_score(r.churn as f64);
+        let uz_auth  = d_auth.z_score(r.authors as f64);
+        let uz_scat  = d_scat.z_score(r.scatter);
 
-        let raw_structural = z_comp + z_hal + z_clone;
-        let raw_process    = z_churn + z_auth + z_scat;
-        let raw_stability  = z_red + z_age;
+        let uz_red = d_red.z_score(r.redundancy);
+        let uz_age = d_age.z_score(r.age_months);
+
+        let raw_structural = (uz_comp + uz_hal + uz_clone) * r.weights.structural;
+        let raw_process    = (uz_churn + uz_auth + uz_scat) * r.weights.process;
+        let raw_stability  = (uz_red + uz_age) * r.weights.stability;
+
+        let unweighted_structural = uz_comp + uz_hal + uz_clone;
+        let unweighted_process    = uz_churn + uz_auth + uz_scat;
+        let unweighted_stability  = uz_red + uz_age;
 
         if !raw_structural.is_finite() || !raw_process.is_finite() || !raw_stability.is_finite() {
             eprintln!("DEGENERATE: non-finite risk axis in {}:{} — zeroing", r.file, r.name);
@@ -202,9 +206,9 @@ pub fn calculate_hybrid_risk(
         let process    = if raw_process.is_finite()    { raw_process    } else { 0.0 };
         let stability  = if raw_stability.is_finite()  { raw_stability  } else { 0.0 };
 
-        r.profile.structural = MetricValue { value: structural, z_score: structural, grain: "scope" };
-        r.profile.process    = MetricValue { value: process,    z_score: process,    grain: "file"  };
-        r.profile.stability  = MetricValue { value: stability,  z_score: stability,  grain: "file"  };
+        r.profile.structural = MetricValue { value: structural, z_score: unweighted_structural, grain: "scope" };
+        r.profile.process    = MetricValue { value: process,    z_score: unweighted_process,    grain: "file"  };
+        r.profile.stability  = MetricValue { value: stability,  z_score: unweighted_stability,  grain: "file"  };
 
         r.risk_score = (1.0 + structural) * (1.0 + process) / (1.0 + stability).max(0.1);
 
@@ -216,17 +220,18 @@ pub fn calculate_hybrid_risk(
     // Calculate percentiles
     let mut scores: Vec<f64> = reports.iter().map(|r| r.risk_score).collect();
     scores.sort_by(|a, b| a.total_cmp(b));
-    
+
     for r in reports.iter_mut() {
-        let pos = scores.binary_search_by(|s| s.total_cmp(&r.risk_score)).unwrap_or(0);
-        r.percentile = (pos as f64) / (scores.len() as f64);
+        let pos = scores.partition_point(|s| s.total_cmp(&r.risk_score) == std::cmp::Ordering::Less);
+        r.percentile = pos as f64 / scores.len() as f64;
         r.advice = generate_advice(r, &r.profile);
     }
 }
 
 pub fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len - 3])
+    if s.chars().count() > max_len {
+        let byte_end = s.char_indices().nth(max_len - 3).map(|(i, _)| i).unwrap_or(s.len());
+        format!("{}...", &s[..byte_end])
     } else {
         s.to_string()
     }
@@ -286,6 +291,59 @@ mod tests {
         assert_eq!(d.z_score(3.0), 0.0);
         assert!(d.z_score(5.0) > 0.0);
         assert!(d.z_score(1.0) < 0.0);
+    }
+
+    #[test]
+    fn advice_clone_fires_above_threshold() {
+        use crate::clone_engine::CloneMatch;
+        let mut r = stub_report(5.0);
+        r.clone_ratio = 0.4;
+        r.clone_matches = vec![CloneMatch { other_file: "b.rs".into(), other_start: 1, my_start: 1 }];
+        let profile = RiskProfile {
+            structural: MetricValue { value: 2.0, z_score: 2.0, grain: "scope" },
+            process:    MetricValue { value: 1.0, z_score: 1.0, grain: "file"  },
+            stability:  MetricValue { value: 0.0, z_score: 0.0, grain: "file"  },
+        };
+        let advice = generate_advice(&r, &profile);
+        assert!(advice.starts_with("CLONE"), "got: {advice}");
+    }
+
+    #[test]
+    fn advice_testing_debt_when_high_structural_and_low_coverage() {
+        let mut r = stub_report(10.0);
+        r.coverage = 0.2;
+        let profile = RiskProfile {
+            structural: MetricValue { value: 6.0, z_score: 6.0, grain: "scope" },
+            process:    MetricValue { value: 2.0, z_score: 2.0, grain: "file"  },
+            stability:  MetricValue { value: 0.0, z_score: 0.0, grain: "file"  },
+        };
+        let advice = generate_advice(&r, &profile);
+        assert!(advice.starts_with("TESTING DEBT"), "got: {advice}");
+    }
+
+    #[test]
+    fn advice_knowledge_silo_single_author() {
+        let mut r = stub_report(5.0);
+        r.authors = 1;
+        let profile = RiskProfile {
+            structural: MetricValue { value: 1.0, z_score: 1.0, grain: "scope" },
+            process:    MetricValue { value: 4.0, z_score: 4.0, grain: "file"  },
+            stability:  MetricValue { value: 0.0, z_score: 0.0, grain: "file"  },
+        };
+        let advice = generate_advice(&r, &profile);
+        assert!(advice.starts_with("KNOWLEDGE SILO"), "got: {advice}");
+    }
+
+    #[test]
+    fn advice_nan_is_degenerate() {
+        let r = stub_report(f64::NAN);
+        let profile = RiskProfile {
+            structural: MetricValue { value: f64::NAN, z_score: f64::NAN, grain: "scope" },
+            process:    MetricValue { value: f64::NAN, z_score: f64::NAN, grain: "file"  },
+            stability:  MetricValue { value: f64::NAN, z_score: f64::NAN, grain: "file"  },
+        };
+        let advice = generate_advice(&r, &profile);
+        assert!(advice.starts_with("DEGENERATE"), "got: {advice}");
     }
 
     #[test]

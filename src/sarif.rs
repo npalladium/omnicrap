@@ -2,7 +2,7 @@ use crate::RiskReport;
 use serde::Serialize;
 
 const DRIVER_NAME: &str = "omni-crap";
-const DRIVER_VERSION: &str = "0.1.0";
+const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RULE_ID: &str = "omni-crap/high-risk";
 const SARIF_VERSION: &str = "2.1.0";
 const SARIF_SCHEMA_URL: &str = "https://json.schemastore.org/sarif-2.1.0.json";

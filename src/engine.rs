@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::collections::HashMap;
 use anyhow::Result;
 use serde::Serialize;
 
@@ -21,6 +20,13 @@ pub enum TestKind {
     E2E,         // Impure, touches external world (Disk, Network, DB)
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Metrics {
+    pub complexity: f64,
+    pub halstead: f64,
+    pub redundancy: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScopeInfo {
     pub name: String,
@@ -31,7 +37,7 @@ pub struct ScopeInfo {
     pub clone_matches: Vec<CloneMatch>,
     pub start_line: usize,
     pub end_line: usize,
-    pub metrics: HashMap<String, f64>,
+    pub metrics: Metrics,
 }
 
 pub trait LanguageEngine: Send + Sync {

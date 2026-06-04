@@ -1,7 +1,7 @@
 use std::path::Path;
 use arborium::tree_sitter::{self, Parser, Query, QueryCursor, StreamingIterator};
 use anyhow::{Context, Result};
-use crate::engine::{LanguageEngine, ScopeInfo, ScopeKind, TestKind};
+use crate::engine::{LanguageEngine, Metrics, ScopeInfo, ScopeKind, TestKind};
 use crate::clone_engine::{CloneStore, Token};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -9,6 +9,52 @@ use std::cell::RefCell;
 
 thread_local! {
     static PARSER_CACHE: RefCell<HashMap<&'static str, (Parser, Query)>> = RefCell::new(HashMap::new());
+}
+
+fn lang_config(ext: &str) -> Option<(&'static str, &'static str)> {
+    let lang_name: &'static str = match ext {
+        "rs" => "rust",
+        "py" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
+        "go" => "go",
+        "java" => "java",
+        "cs" => "c-sharp",
+        "rb" => "ruby",
+        "php" => "php",
+        "swift" => "swift",
+        "kt" => "kotlin",
+        "scala" => "scala",
+        "sh" => "bash",
+        _ => return None,
+    };
+
+    let query_str: &'static str = match lang_name {
+        "rust" => r#"[
+            (function_item name: (identifier) @name) @func
+            (impl_item type: (_) @name) @class
+            (trait_item name: (type_identifier) @name) @class
+            (struct_item name: (type_identifier) @name) @class
+            (enum_item name: (type_identifier) @name) @class
+        ]"#,
+        "python" => "[ (function_definition name: (identifier) @name) @func (class_definition name: (identifier) @name) @class ]",
+        "javascript" => "[(function_declaration name: (identifier) @name) @func (function_expression name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
+        "typescript" => "[(function_declaration name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
+        "c" | "cpp" => "[ (function_definition declarator: (function_declarator declarator: (identifier) @name)) @func (class_specifier name: (type_identifier) @name) @class ]",
+        "go" => "[(function_declaration name: (identifier) @name) @func (type_declaration (type_spec name: (type_identifier) @name)) @class]",
+        "java" | "c-sharp" => "[ (method_declaration name: (identifier) @name) @func (class_declaration name: (identifier) @name) @class ]",
+        "ruby" => "[(method name: (identifier) @name) @func (class name: (constant) @name) @class]",
+        "php" => "[(function_definition name: (name) @name) @func (class_declaration name: (name) @name) @class]",
+        "swift" => "[(function_declaration name: (simple_identifier) @name) @func (class_declaration name: (type_identifier) @name) @class (struct_declaration name: (type_identifier) @name) @class]",
+        "kotlin" => "[(function_declaration name: (simple_identifier) @name) @func (class_declaration name: (type_identifier) @name) @class]",
+        "scala" => "[(function_definition name: (identifier) @name) @func (class_definition name: (identifier) @name) @class]",
+        "bash" => "(function_definition name: (word) @name) @func",
+        _ => return None,
+    };
+
+    Some((lang_name, query_str))
 }
 
 pub struct TreeSitterEngine {
@@ -35,50 +81,12 @@ impl LanguageEngine for TreeSitterEngine {
         )
     }
 
-    fn register_clones(&self, _path: &Path, content: &str) -> Result<()> {
-        let extension = _path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let relative_path = _path.to_string_lossy().to_string();
-
-        let lang_name = match extension {
-            "rs" => "rust",
-            "py" => "python",
-            "js" | "mjs" | "cjs" => "javascript",
-            "ts" | "tsx" => "typescript",
-            "c" | "h" => "c",
-            "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
-            "go" => "go",
-            "java" => "java",
-            "cs" => "c-sharp",
-            "rb" => "ruby",
-            "php" => "php",
-            "swift" => "swift",
-            "kt" => "kotlin",
-            "scala" => "scala",
-            "sh" => "bash",
-            _ => return Ok(()),
-        };
-
-        let query_str = match lang_name {
-            "rust" => r#"[
-                (function_item name: (identifier) @name) @func
-                (impl_item type: (_) @name) @class
-                (trait_item name: (type_identifier) @name) @class
-                (struct_item name: (type_identifier) @name) @class
-                (enum_item name: (type_identifier) @name) @class
-            ]"#,
-            "python" => "[ (function_definition name: (identifier) @name) @func (class_definition name: (identifier) @name) @class ]",
-            "javascript" => "[(function_declaration name: (identifier) @name) @func (function_expression name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
-            "typescript" => "[(function_declaration name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
-            "c" | "cpp" => "[ (function_definition declarator: (function_declarator declarator: (identifier) @name)) @func (class_specifier name: (type_identifier) @name) @class ]",
-            "go" => "[(function_declaration name: (identifier) @name) @func (type_declaration (type_spec name: (type_identifier) @name)) @class]",
-            "java" | "c-sharp" => "[ (method_declaration name: (identifier) @name) @func (class_declaration name: (identifier) @name) @class ]",
-            "ruby" => "[(method name: (identifier) @name) @func (class name: (constant) @name) @class]",
-            "php" => "[(function_definition name: (name) @name) @func (class_declaration name: (name) @name) @class]",
-            "swift" => "[(function_declaration name: (simple_identifier) @name) @func (class_declaration name: (type_identifier) @name) @class (struct_declaration name: (type_identifier) @name) @class]",
-            "kotlin" => "[(function_declaration name: (simple_identifier) @name) @func (class_declaration name: (type_identifier) @name) @class]",
-            "scala" => "[(function_definition name: (identifier) @name) @func (class_definition name: (identifier) @name) @class]",
-            "bash" => "(function_definition name: (word) @name) @func",
-            _ => return Ok(()),
+    fn register_clones(&self, path: &Path, content: &str) -> Result<()> {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let relative_path = path.to_string_lossy().to_string();
+        let (lang_name, query_str) = match lang_config(ext) {
+            Some(cfg) => cfg,
+            None => return Ok(()),
         };
 
         if let Some(ref store) = self.clone_store {
@@ -107,51 +115,11 @@ impl LanguageEngine for TreeSitterEngine {
         }
     }
 
-    fn analyze(&self, _path: &Path, content: &str) -> Result<Vec<ScopeInfo>> {
-        let extension = _path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let relative_path = _path.to_string_lossy().to_string();
-
-        let lang_name = match extension {
-            "rs" => "rust",
-            "py" => "python",
-            "js" | "mjs" | "cjs" => "javascript",
-            "ts" | "tsx" => "typescript",
-            "c" | "h" => "c",
-            "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
-            "go" => "go",
-            "java" => "java",
-            "cs" => "c-sharp",
-            "rb" => "ruby",
-            "php" => "php",
-            "swift" => "swift",
-            "kt" => "kotlin",
-            "scala" => "scala",
-            "sh" => "bash",
-            _ => anyhow::bail!("Unsupported language extension: {}", extension),
-        };
-
-        let query_str = match lang_name {
-            "rust" => r#"[
-                (function_item name: (identifier) @name) @func
-                (impl_item type: (_) @name) @class
-                (trait_item name: (type_identifier) @name) @class
-                (struct_item name: (type_identifier) @name) @class
-                (enum_item name: (type_identifier) @name) @class
-            ]"#,
-            "python" => "[ (function_definition name: (identifier) @name) @func (class_definition name: (identifier) @name) @class ]",
-            "javascript" => "[(function_declaration name: (identifier) @name) @func (function_expression name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
-            "typescript" => "[(function_declaration name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
-            "c" | "cpp" => "[ (function_definition declarator: (function_declarator declarator: (identifier) @name)) @func (class_specifier name: (type_identifier) @name) @class ]",
-            "go" => "[(function_declaration name: (identifier) @name) @func (type_declaration (type_spec name: (type_identifier) @name)) @class]",
-            "java" | "c-sharp" => "[ (method_declaration name: (identifier) @name) @func (class_declaration name: (identifier) @name) @class ]",
-            "ruby" => "[(method name: (identifier) @name) @func (class name: (constant) @name) @class]",
-            "php" => "[(function_definition name: (name) @name) @func (class_declaration name: (name) @name) @class]",
-            "swift" => "[(function_declaration name: (simple_identifier) @name) @func (class_declaration name: (type_identifier) @name) @class (struct_declaration name: (type_identifier) @name) @class]",
-            "kotlin" => "[(function_declaration name: (simple_identifier) @name) @func (class_declaration name: (type_identifier) @name) @class]",
-            "scala" => "[(function_definition name: (identifier) @name) @func (class_definition name: (identifier) @name) @class]",
-            "bash" => "(function_definition name: (word) @name) @func",
-            _ => anyhow::bail!("No query string for language: {}", lang_name),
-        };
+    fn analyze(&self, path: &Path, content: &str) -> Result<Vec<ScopeInfo>> {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let relative_path = path.to_string_lossy().to_string();
+        let (lang_name, query_str) = lang_config(ext)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported language extension: {}", ext))?;
 
         PARSER_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -185,23 +153,25 @@ impl LanguageEngine for TreeSitterEngine {
                 (0.0, Vec::new())
             };
 
-            let module_complexity = self.calculate_complexity(root_node, extension) as f64;
-            let module_halstead = self.calculate_halstead(root_node, content, extension);
-            
-            let mut module_metrics = HashMap::new();
-            module_metrics.insert("complexity".to_string(), module_complexity);
-            module_metrics.insert("halstead".to_string(), module_halstead);
+            let module_complexity = self.calculate_complexity(root_node, ext) as f64;
+            let module_halstead = self.calculate_halstead(root_node, content, ext);
+
+            let metrics = Metrics {
+                complexity: module_complexity,
+                halstead: module_halstead,
+                redundancy: 0.0,
+            };
 
             scopes.push(ScopeInfo {
                 name: "Global".to_string(),
                 kind: ScopeKind::Module,
-                test_kind: self.detect_test_kind(_path, content, root_node),
-                mock_count: self.count_mocks(content, extension),
+                test_kind: self.detect_test_kind(path, content, root_node),
+                mock_count: self.count_mocks(content, ext),
                 clone_ratio: file_clone_ratio,
                 clone_matches: file_clone_matches.clone(),
                 start_line: 1,
                 end_line: content.lines().count().max(1),
-                metrics: module_metrics,
+                metrics,
             });
 
             while let Some(m) = matches.next() {
@@ -236,9 +206,9 @@ impl LanguageEngine for TreeSitterEngine {
                 let start_line = scope_node.start_position().row + 1;
                 let end_line = scope_node.end_position().row + 1;
 
-                let complexity = self.calculate_complexity(scope_node, extension) as f64;
+                let complexity = self.calculate_complexity(scope_node, ext) as f64;
                 let source = &content[scope_node.byte_range()];
-                let halstead = self.calculate_halstead(scope_node, content, extension);
+                let halstead = self.calculate_halstead(scope_node, content, ext);
                 // Efficiently filter clones for this scope using the fact that they are sorted by line
                 let start_idx = file_clone_matches.partition_point(|m| m.my_start < start_line);
                 let end_idx = file_clone_matches.partition_point(|m| m.my_start <= end_line);
@@ -256,15 +226,17 @@ impl LanguageEngine for TreeSitterEngine {
                     matched_lines.len() as f64 / (end_line - start_line + 1).max(1) as f64
                 };
 
-                let mut metrics = HashMap::new();
-                metrics.insert("complexity".to_string(), complexity);
-                metrics.insert("halstead".to_string(), halstead);
+                let metrics = Metrics {
+                    complexity,
+                    halstead,
+                    redundancy: 0.0,
+                };
 
                 scopes.push(ScopeInfo {
                     name,
                     kind,
-                    test_kind: self.detect_test_kind(_path, source, scope_node),
-                    mock_count: self.count_mocks(source, extension),
+                    test_kind: self.detect_test_kind(path, source, scope_node),
+                    mock_count: self.count_mocks(source, ext),
                     clone_ratio: scope_clone_ratio,
                     clone_matches: scope_clone_matches,
                     start_line,
@@ -428,15 +400,18 @@ impl TreeSitterEngine {
             _ => return self.calculate_halstead_legacy(node, content),
         };
 
+        let ops_set: HashSet<&str> = ops_kinds.into_iter().collect();
+        let op_set: HashSet<&str> = op_kinds.into_iter().collect();
+
         let mut cursor = node.walk();
         let mut stack = vec![node];
 
         while let Some(current) = stack.pop() {
             let kind = current.kind();
-            if ops_kinds.contains(&kind) {
+            if ops_set.contains(kind) {
                 n1_kinds.insert(kind);
                 big_n1 += 1;
-            } else if op_kinds.contains(&kind) {
+            } else if op_set.contains(kind) {
                 n2_kinds.insert(kind);
                 big_n2 += 1;
             }
@@ -579,7 +554,7 @@ mod tests {
         let src2 = "function sum(x, y) { return x + y; }";
         let s1 = engine.analyze(std::path::Path::new("t.js"), src1).unwrap();
         let s2 = engine.analyze(std::path::Path::new("t.js"), src2).unwrap();
-        assert_eq!(s1[0].metrics["halstead"], s2[0].metrics["halstead"],
+        assert_eq!(s1[0].metrics.halstead, s2[0].metrics.halstead,
             "halstead must not change when identifiers are renamed");
     }
 
@@ -590,7 +565,7 @@ mod tests {
         let src2 = "package p\nfunc sum(x int, y int) int { return x + y }";
         let s1 = engine.analyze(std::path::Path::new("t.go"), src1).unwrap();
         let s2 = engine.analyze(std::path::Path::new("t.go"), src2).unwrap();
-        assert_eq!(s1[0].metrics["halstead"], s2[0].metrics["halstead"],
+        assert_eq!(s1[0].metrics.halstead, s2[0].metrics.halstead,
             "halstead must not change when Go identifiers are renamed");
     }
 }

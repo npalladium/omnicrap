@@ -142,6 +142,48 @@ mod tests {
     }
 
     #[test]
+    fn weights_override_matches_glob() {
+        let mut cfg = Config::default();
+        cfg.overrides.push(OverrideConfig {
+            path: "tests/**".to_string(),
+            weights: PartialRiskWeights {
+                structural: Some(0.5),
+                process: Some(0.0),
+                stability: None,
+            },
+        });
+        let w = cfg.get_weights_for_path("tests/foo/bar.rs");
+        assert_eq!(w.structural, 0.5);
+        assert_eq!(w.process, 0.0);
+        assert_eq!(w.stability, 1.0); // default
+    }
+
+    #[test]
+    fn weights_override_first_match_wins() {
+        let mut cfg = Config::default();
+        cfg.overrides.push(OverrideConfig {
+            path: "tests/**".to_string(),
+            weights: PartialRiskWeights { structural: Some(0.1), process: None, stability: None },
+        });
+        cfg.overrides.push(OverrideConfig {
+            path: "tests/integration/**".to_string(),
+            weights: PartialRiskWeights { structural: Some(0.9), process: None, stability: None },
+        });
+        // First override wins even though second is more specific
+        let w = cfg.get_weights_for_path("tests/integration/foo.rs");
+        assert_eq!(w.structural, 0.1);
+    }
+
+    #[test]
+    fn weights_no_match_returns_defaults() {
+        let cfg = Config::default();
+        let w = cfg.get_weights_for_path("src/main.rs");
+        assert_eq!(w.structural, 1.0);
+        assert_eq!(w.process, 1.0);
+        assert_eq!(w.stability, 1.0);
+    }
+
+    #[test]
     fn loads_config_from_same_dir() {
         let dir = tempdir().unwrap();
         write_config(dir.path(), ".omni-crap.toml", "threshold = 5.0\n");
@@ -197,6 +239,36 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let cfg = Config::load(dir.path()).unwrap();
         assert_eq!(cfg.threshold, 10.0); // default
+    }
+}
+
+pub struct WeightMatchers(Vec<(ignore::gitignore::Gitignore, RiskWeights)>);
+
+impl WeightMatchers {
+    pub fn build(config: &Config) -> Self {
+        let matchers = config.overrides.iter().map(|ovr| {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
+            let _ = builder.add_line(None, &ovr.path);
+            let gi = builder.build().unwrap_or_else(|_| {
+                ignore::gitignore::GitignoreBuilder::new(".").build().unwrap()
+            });
+            let w = RiskWeights {
+                structural: ovr.weights.structural.unwrap_or(config.weights.structural),
+                process:    ovr.weights.process.unwrap_or(config.weights.process),
+                stability:  ovr.weights.stability.unwrap_or(config.weights.stability),
+            };
+            (gi, w)
+        }).collect();
+        Self(matchers)
+    }
+
+    pub fn resolve(&self, path: &str, base: &RiskWeights) -> RiskWeights {
+        for (gi, weights) in &self.0 {
+            if gi.matched(path, false).is_ignore() {
+                return weights.clone();
+            }
+        }
+        base.clone()
     }
 }
 
