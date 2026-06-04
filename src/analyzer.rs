@@ -67,7 +67,7 @@ impl LanguageEngine for TreeSitterEngine {
                 (enum_item name: (type_identifier) @name) @class
             ]"#,
             "python" => "[ (function_definition name: (identifier) @name) @func (class_definition name: (identifier) @name) @class ]",
-            "javascript" => "[(function_declaration name: (identifier) @name) @func (function name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
+            "javascript" => "[(function_declaration name: (identifier) @name) @func (function_expression name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
             "typescript" => "[(function_declaration name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
             "c" | "cpp" => "[ (function_definition declarator: (function_declarator declarator: (identifier) @name)) @func (class_specifier name: (type_identifier) @name) @class ]",
             "go" => "[(function_declaration name: (identifier) @name) @func (type_declaration (type_spec name: (type_identifier) @name)) @class]",
@@ -139,7 +139,7 @@ impl LanguageEngine for TreeSitterEngine {
                 (enum_item name: (type_identifier) @name) @class
             ]"#,
             "python" => "[ (function_definition name: (identifier) @name) @func (class_definition name: (identifier) @name) @class ]",
-            "javascript" => "[(function_declaration name: (identifier) @name) @func (function name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
+            "javascript" => "[(function_declaration name: (identifier) @name) @func (function_expression name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
             "typescript" => "[(function_declaration name: (identifier) @name) @func (method_definition name: (property_identifier) @name) @func (class_declaration name: (identifier) @name) @class]",
             "c" | "cpp" => "[ (function_definition declarator: (function_declarator declarator: (identifier) @name)) @func (class_specifier name: (type_identifier) @name) @class ]",
             "go" => "[(function_declaration name: (identifier) @name) @func (type_declaration (type_spec name: (type_identifier) @name)) @class]",
@@ -374,6 +374,57 @@ impl TreeSitterEngine {
                 vec!["+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "and", "or", "not", "=", "+=", "-=", "*=", "/=", "if_statement", "for_statement", "while_statement", "return_statement"],
                 vec!["identifier", "integer", "string", "true", "false", "float"]
             ),
+            "js" | "mjs" | "cjs" | "ts" | "tsx" => (
+                vec!["binary_expression", "unary_expression", "assignment_expression",
+                     "augmented_assignment_expression", "if_statement", "for_statement",
+                     "for_in_statement", "while_statement", "do_statement",
+                     "switch_statement", "return_statement", "ternary_expression",
+                     "await_expression", "yield_expression", "&&", "||", "??", "!",
+                     "+", "-", "*", "/", "%", "**", "==", "===", "!=", "!==",
+                     "<", ">", "<=", ">=", "=", "+=", "-=", "*=", "/="],
+                vec!["identifier", "number", "string", "template_string",
+                     "true", "false", "null", "undefined", "this"]
+            ),
+            "go" => (
+                vec!["binary_expression", "unary_expression", "assignment_statement",
+                     "short_var_declaration", "if_statement", "for_statement",
+                     "switch_statement", "select_statement", "return_statement",
+                     "defer_statement", "go_statement", "range_clause",
+                     "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
+                     "&&", "||", "!", "=", ":=", "+=", "-=", "*=", "/="],
+                vec!["identifier", "int_literal", "float_literal", "imaginary_literal",
+                     "string_literal", "rune_literal", "true", "false", "nil"]
+            ),
+            "java" => (
+                vec!["binary_expression", "unary_expression", "assignment_expression",
+                     "if_statement", "for_statement", "enhanced_for_statement",
+                     "while_statement", "do_statement", "switch_expression",
+                     "return_statement", "conditional_expression", "instanceof",
+                     "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
+                     "&&", "||", "!", "=", "+=", "-=", "*=", "/="],
+                vec!["identifier", "decimal_integer_literal", "hex_integer_literal",
+                     "decimal_floating_point_literal", "string_literal",
+                     "true", "false", "null_literal", "this"]
+            ),
+            "cs" => (
+                vec!["binary_expression", "prefix_unary_expression", "postfix_unary_expression",
+                     "assignment_expression", "if_statement", "for_statement", "foreach_statement",
+                     "while_statement", "do_statement", "switch_statement", "return_statement",
+                     "conditional_expression",
+                     "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
+                     "&&", "||", "!", "=", "+=", "-=", "*=", "/=", "??"],
+                vec!["identifier", "integer_literal", "real_literal", "string_literal",
+                     "true", "false", "null_literal", "this"]
+            ),
+            "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" => (
+                vec!["binary_expression", "unary_expression", "assignment_expression",
+                     "if_statement", "for_statement", "while_statement", "do_statement",
+                     "switch_statement", "return_statement", "conditional_expression",
+                     "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
+                     "&&", "||", "!", "=", "+=", "-=", "*=", "/="],
+                vec!["identifier", "number_literal", "string_literal",
+                     "true", "false", "null"]
+            ),
             _ => return self.calculate_halstead_legacy(node, content),
         };
 
@@ -484,5 +535,32 @@ impl TreeSitterEngine {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn halstead_js_rename_invariant() {
+        let engine = TreeSitterEngine::new(None);
+        let src1 = "function add(a, b) { return a + b; }";
+        let src2 = "function sum(x, y) { return x + y; }";
+        let s1 = engine.analyze(std::path::Path::new("t.js"), src1).unwrap();
+        let s2 = engine.analyze(std::path::Path::new("t.js"), src2).unwrap();
+        assert_eq!(s1[0].metrics["halstead"], s2[0].metrics["halstead"],
+            "halstead must not change when identifiers are renamed");
+    }
+
+    #[test]
+    fn halstead_go_rename_invariant() {
+        let engine = TreeSitterEngine::new(None);
+        let src1 = "package p\nfunc add(a int, b int) int { return a + b }";
+        let src2 = "package p\nfunc sum(x int, y int) int { return x + y }";
+        let s1 = engine.analyze(std::path::Path::new("t.go"), src1).unwrap();
+        let s2 = engine.analyze(std::path::Path::new("t.go"), src2).unwrap();
+        assert_eq!(s1[0].metrics["halstead"], s2[0].metrics["halstead"],
+            "halstead must not change when Go identifiers are renamed");
     }
 }
