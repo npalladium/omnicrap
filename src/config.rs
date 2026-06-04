@@ -3,6 +3,49 @@ use std::path::Path;
 use std::fs;
 use anyhow::Result;
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassAction {
+    /// Skip the file entirely; it will not appear in any analysis output.
+    Exclude,
+    /// Analyze the file but mark it in the output table.
+    Flag,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ClassifierConfig {
+    /// Additional generated patterns (directory prefixes or file suffixes).
+    #[serde(default)]
+    pub generated: Vec<String>,
+    /// Additional vendored patterns.
+    #[serde(default)]
+    pub vendored: Vec<String>,
+    /// Suppress a specific built-in pattern (exact string match).
+    #[serde(default)]
+    pub suppress: Vec<String>,
+    /// What to do with detected generated files. Default: exclude.
+    #[serde(default = "default_generated_action")]
+    pub generated_action: ClassAction,
+    /// What to do with detected vendored files. Default: flag.
+    #[serde(default = "default_vendored_action")]
+    pub vendored_action: ClassAction,
+}
+
+fn default_generated_action() -> ClassAction { ClassAction::Exclude }
+fn default_vendored_action()   -> ClassAction { ClassAction::Flag }
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        Self {
+            generated: Vec::new(),
+            vendored: Vec::new(),
+            suppress: Vec::new(),
+            generated_action: ClassAction::Exclude,
+            vendored_action: ClassAction::Flag,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_threshold")]
@@ -17,6 +60,8 @@ pub struct Config {
     pub max_file_size: u64,
     #[serde(default)]
     pub overrides: Vec<OverrideConfig>,
+    #[serde(default)]
+    pub classifier: ClassifierConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -82,6 +127,7 @@ impl Default for Config {
             clone: CloneConfig::default(),
             max_file_size: 1_000_000,
             overrides: Vec::new(),
+            classifier: ClassifierConfig::default(),
         }
     }
 }

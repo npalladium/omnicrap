@@ -1,6 +1,7 @@
 use omni_crap::analyzer::TreeSitterEngine;
+use omni_crap::classifier::{FileClass, FileClassifier, Classification, read_head_bytes};
 use omni_crap::clone_engine::CloneStore;
-use omni_crap::config::Config;
+use omni_crap::config::{ClassAction, Config};
 use omni_crap::coverage::{CoverageParser, lcov::LcovParser, cobertura::CoberturaParser};
 use omni_crap::engine::LanguageEngine;
 use omni_crap::regex_engine::RegexEngine;
@@ -14,7 +15,7 @@ use comfy_table::{Table, ContentArrangement, presets};
 use std::path::PathBuf;
 use std::fs;
 use std::process::Command;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -36,7 +37,8 @@ refactoring, review, and testing effort.",
   omni-crap --stats                          Line-count roll-up per file
   omni-crap --diff                           Only score changed files (fast CI use)
   omni-crap --trend --since \"180 days\"     Flag rising complexity hotspots
-  omni-crap --crap --coverage lcov.info      Classical CRAP metric"
+  omni-crap --crap --coverage lcov.info      Classical CRAP metric
+  omni-crap --generated-report               Show all detected generated/vendored files"
 )]
 struct Args {
     /// Target directory to analyze
@@ -90,6 +92,10 @@ struct Args {
     /// Append a complexity-trend column (compares against 1 month ago)
     #[arg(long, default_value_t = false, help_heading = "Output")]
     trend: bool,
+
+    /// Show a table of all detected generated/vendored files with their detection reason
+    #[arg(long, default_value_t = false, help_heading = "Output")]
+    generated_report: bool,
 
     // ── Risk model ────────────────────────────────────────────────────────────
 
@@ -146,6 +152,8 @@ fn main() -> anyhow::Result<()> {
     let threshold = args.threshold.unwrap_or(config.threshold);
     let min_tokens = args.clone_min_tokens.unwrap_or(config.clone.min_tokens);
     let max_file_size = args.max_file_size.unwrap_or(config.max_file_size);
+
+    let classifier = FileClassifier::new(config.classifier.clone(), &args.path);
 
     let clone_store = if args.no_clones {
         None
@@ -262,7 +270,9 @@ fn main() -> anyhow::Result<()> {
         String::new()
     };
 
-    let files: Vec<_> = ignore::WalkBuilder::new(&args.path)
+    // ── Walk: collect and classify all files ──────────────────────────────────
+
+    let all_files: Vec<_> = ignore::WalkBuilder::new(&args.path)
         .standard_filters(true)
         .build()
         .filter_map(|e| {
@@ -270,12 +280,93 @@ fn main() -> anyhow::Result<()> {
             if entry.file_type()?.is_file() {
                 let len = entry.metadata().ok()?.len();
                 if len > max_file_size {
-                    eprintln!("Skipping {} (size {} bytes exceeds limit {} bytes)", entry.path().display(), len, max_file_size);
+                    eprintln!("Skipping {} (size {} bytes exceeds limit {} bytes)",
+                        entry.path().display(), len, max_file_size);
                     return None;
                 }
                 Some(entry)
             } else {
                 None
+            }
+        })
+        .collect();
+
+    // Classification pass (sequential, runs before parallel analysis).
+    // Reads only the first 512 bytes per file for header scanning.
+    let mut gen_excluded  = 0usize;
+    let mut vendor_excluded = 0usize;
+    // path → classification for files that are *flagged* (not excluded)
+    let mut flagged: HashMap<String, FileClass> = HashMap::new();
+    // full record of all classified files (for --generated-report)
+    let mut classified_log: Vec<(String, Classification)> = Vec::new();
+    // paths to skip in analysis passes
+    let mut excluded_paths: HashSet<String> = HashSet::new();
+
+    for entry in &all_files {
+        let path = entry.path();
+        let relative_path = match path.strip_prefix(&args.path) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+
+        if config.ignore.iter().any(|i| relative_path.contains(i.as_str())) {
+            continue;
+        }
+
+        let head = read_head_bytes(path, 512);
+        if let Some(cls) = classifier.classify(&relative_path, &head) {
+            match cls.action {
+                ClassAction::Exclude => {
+                    excluded_paths.insert(relative_path.clone());
+                    match cls.class {
+                        FileClass::Generated => gen_excluded += 1,
+                        FileClass::Vendored  => vendor_excluded += 1,
+                    }
+                }
+                ClassAction::Flag => {
+                    flagged.insert(relative_path.clone(), cls.class);
+                }
+            }
+            classified_log.push((relative_path, cls));
+        }
+    }
+
+    // Short-circuit: show generated/vendored report and exit.
+    if args.generated_report {
+        if classified_log.is_empty() {
+            println!("No generated or vendored files detected.");
+        } else {
+            let mut table = make_table();
+            table.set_header(vec!["File", "Type", "Action", "Signal", "Pattern"]);
+            for (path, cls) in &classified_log {
+                let type_str = match cls.class {
+                    FileClass::Generated => "generated",
+                    FileClass::Vendored  => "vendored",
+                };
+                let action_str = match cls.action {
+                    ClassAction::Exclude => "exclude",
+                    ClassAction::Flag    => "flag",
+                };
+                table.add_row(vec![
+                    path.clone(),
+                    type_str.to_string(),
+                    action_str.to_string(),
+                    cls.reason.to_string(),
+                    cls.pattern.clone(),
+                ]);
+            }
+            println!("{table}");
+        }
+        return Ok(());
+    }
+
+    // Filter excluded files out of the working set for analysis passes.
+    let files: Vec<_> = all_files.into_iter()
+        .filter(|entry| {
+            let path = entry.path();
+            match path.strip_prefix(&args.path) {
+                Ok(rel) => !excluded_paths.contains(rel.to_string_lossy().as_ref()),
+                Err(_)  => true,
             }
         })
         .collect();
@@ -288,7 +379,7 @@ fn main() -> anyhow::Result<()> {
                 Ok(p) => p.to_string_lossy().to_string(),
                 Err(_) => return,
             };
-            if config.ignore.iter().any(|i| relative_path.contains(i)) {
+            if config.ignore.iter().any(|i| relative_path.contains(i.as_str())) {
                 return;
             }
             if let Ok(content) = fs::read_to_string(path) {
@@ -313,7 +404,7 @@ fn main() -> anyhow::Result<()> {
             return Vec::new();
         }
 
-        if config.ignore.iter().any(|i| relative_path.contains(i)) {
+        if config.ignore.iter().any(|i| relative_path.contains(i.as_str())) {
             return Vec::new();
         }
 
@@ -347,6 +438,8 @@ fn main() -> anyhow::Result<()> {
             (0, 0, 0.0, 0.0, 0.0)
         };
 
+        let file_class = flagged.get(&relative_path).copied();
+
         let mut past_scopes = None;
         if args.trend && !past_commit_hash.is_empty() && file_churn > 0 {
             let historical_path = if let Some(ref vcs) = vcs_data {
@@ -371,7 +464,7 @@ fn main() -> anyhow::Result<()> {
         let mut local_reports = Vec::new();
         for scope in scopes {
             let complexity = *scope.metrics.get("complexity").unwrap_or(&0.0);
-            let halstead = *scope.metrics.get("halstead").unwrap_or(&0.0);
+            let halstead   = *scope.metrics.get("halstead").unwrap_or(&0.0);
             let redundancy = *scope.metrics.get("redundancy").unwrap_or(&0.0);
 
             let scope_coverage = if let Some(ref cov) = coverage_data {
@@ -413,12 +506,13 @@ fn main() -> anyhow::Result<()> {
                 percentile: 0.0,
                 profile: RiskProfile {
                     structural: MetricValue { value: 0.0, z_score: 0.0, grain: "scope" },
-                    process: MetricValue { value: 0.0, z_score: 0.0, grain: "file" },
-                    stability: MetricValue { value: 0.0, z_score: 0.0, grain: "file" },
+                    process:    MetricValue { value: 0.0, z_score: 0.0, grain: "file" },
+                    stability:  MetricValue { value: 0.0, z_score: 0.0, grain: "file" },
                 },
                 advice: String::new(),
                 engine: engine.name().to_string(),
                 loc: file_stats.clone(),
+                file_class,
                 weights: config.get_weights_for_path(&relative_path),
             };
             local_reports.push(report);
@@ -438,7 +532,6 @@ fn main() -> anyhow::Result<()> {
             r.advice = omni_crap::generate_advice(r, &r.profile);
         }
     } else {
-        // Default to zcrap (Hybrid Z-Score)
         calculate_hybrid_risk(&mut reports, &config);
     }
 
@@ -446,10 +539,10 @@ fn main() -> anyhow::Result<()> {
         let mut table = make_table();
         table.set_header(vec!["File", "Lines", "Code", "Comments", "Blanks"]);
         let mut seen_files = HashSet::new();
-        let mut total_lines = 0usize;
-        let mut total_code = 0usize;
+        let mut total_lines    = 0usize;
+        let mut total_code     = 0usize;
         let mut total_comments = 0usize;
-        let mut total_blanks = 0usize;
+        let mut total_blanks   = 0usize;
 
         for r in &reports {
             if seen_files.insert(&r.file) {
@@ -460,10 +553,10 @@ fn main() -> anyhow::Result<()> {
                     r.loc.comments.to_string(),
                     r.loc.blanks.to_string(),
                 ]);
-                total_lines += r.loc.lines;
-                total_code += r.loc.code;
+                total_lines    += r.loc.lines;
+                total_code     += r.loc.code;
                 total_comments += r.loc.comments;
-                total_blanks += r.loc.blanks;
+                total_blanks   += r.loc.blanks;
             }
         }
         table.add_row(vec![
@@ -474,6 +567,8 @@ fn main() -> anyhow::Result<()> {
             total_blanks.to_string(),
         ]);
         println!("{table}");
+
+        print_exclusion_summary(gen_excluded, vendor_excluded);
         return Ok(());
     }
 
@@ -482,7 +577,6 @@ fn main() -> anyhow::Result<()> {
         let vcs = vcs_data.as_ref().unwrap();
         let top_n = args.deep_top_n;
 
-        // Sort first to get top-N
         reports.sort_by(|a, b| b.risk_score.total_cmp(&a.risk_score));
 
         let mut affected = false;
@@ -511,6 +605,7 @@ fn main() -> anyhow::Result<()> {
     reports.sort_by(|a, b| b.risk_score.total_cmp(&a.risk_score));
 
     let risk_header = if args.crap { "CRAP" } else if args.ccrap { "CCRAP" } else { "Risk" };
+    let has_flagged = reports.iter().any(|r| r.file_class.is_some());
 
     if args.format == "json" {
         println!("{}", serde_json::to_string_pretty(&reports).unwrap());
@@ -520,17 +615,13 @@ fn main() -> anyhow::Result<()> {
     } else {
         let mut table = make_table();
 
-        if args.trend {
-            table.set_header(vec![
-                "File", "Scope", "Kind", "Mocks", "Clone", "Comp", "Trend",
-                "Struct", "Process", "Stable", risk_header,
-            ]);
-        } else {
-            table.set_header(vec![
-                "File", "Scope", "Kind", "Mocks", "Clone", "Comp",
-                "Struct", "Process", "Stable", risk_header,
-            ]);
-        }
+        // Build header row, inserting "Type" when flagged files are present.
+        let mut headers: Vec<&str> = Vec::new();
+        if has_flagged { headers.push("Type"); }
+        headers.extend_from_slice(&["File", "Scope", "Kind", "Mocks", "Clone", "Comp"]);
+        if args.trend { headers.push("Trend"); }
+        headers.extend_from_slice(&["Struct", "Process", "Stable", risk_header]);
+        table.set_header(headers);
 
         for r in reports.iter().take(100) {
             let risk_str = if args.crap || args.ccrap {
@@ -542,47 +633,49 @@ fn main() -> anyhow::Result<()> {
             if let Some(tk) = r.test_kind {
                 kind_str = format!("{:?}({:?})", r.kind, tk);
             }
-            let mock_str = if r.mock_count > 0 { r.mock_count.to_string() } else { "-".to_string() };
+            let mock_str  = if r.mock_count > 0  { r.mock_count.to_string() }      else { "-".to_string() };
             let clone_str = if r.clone_ratio > 0.0 { format!("{:.0}%", r.clone_ratio * 100.0) } else { "-".to_string() };
+            let trend_str = r.trend_delta.map(|d| {
+                if d > 0.0       { format!("+{:.1}", d) }
+                else if d < 0.0  { format!("{:.1}", d) }
+                else             { "0.0".to_string() }
+            });
 
-            if args.trend {
-                let trend_str = match r.trend_delta {
-                    Some(d) if d > 0.0 => format!("+{:.1}", d),
-                    Some(d) if d < 0.0 => format!("{:.1}", d),
-                    Some(_) => "0.0".to_string(),
+            let mut row: Vec<String> = Vec::new();
+            if has_flagged {
+                row.push(match r.file_class {
+                    Some(FileClass::Generated) => "gen".to_string(),
+                    Some(FileClass::Vendored)  => "vendor".to_string(),
                     None => "-".to_string(),
-                };
-                table.add_row(vec![
-                    r.file.clone(),
-                    r.name.clone(),
-                    kind_str,
-                    mock_str,
-                    clone_str,
-                    format!("{:.1}", r.complexity),
-                    trend_str,
-                    format!("{:.1}", r.profile.structural.value),
-                    format!("{:.1}", r.profile.process.value),
-                    format!("{:.1}", r.profile.stability.value),
-                    risk_str,
-                ]);
-            } else {
-                table.add_row(vec![
-                    r.file.clone(),
-                    r.name.clone(),
-                    kind_str,
-                    mock_str,
-                    clone_str,
-                    format!("{:.1}", r.complexity),
-                    format!("{:.1}", r.profile.structural.value),
-                    format!("{:.1}", r.profile.process.value),
-                    format!("{:.1}", r.profile.stability.value),
-                    risk_str,
-                ]);
+                });
             }
+            row.push(r.file.clone());
+            row.push(r.name.clone());
+            row.push(kind_str);
+            row.push(mock_str);
+            row.push(clone_str);
+            row.push(format!("{:.1}", r.complexity));
+            if args.trend {
+                row.push(trend_str.unwrap_or_else(|| "-".to_string()));
+            }
+            row.push(format!("{:.1}", r.profile.structural.value));
+            row.push(format!("{:.1}", r.profile.process.value));
+            row.push(format!("{:.1}", r.profile.stability.value));
+            row.push(risk_str);
+
+            table.add_row(row);
         }
 
         println!("{table}");
     }
 
+    print_exclusion_summary(gen_excluded, vendor_excluded);
+
     Ok(())
+}
+
+fn print_exclusion_summary(generated: usize, vendored: usize) {
+    if generated > 0 || vendored > 0 {
+        eprintln!("Skipped {} generated, {} vendored files.", generated, vendored);
+    }
 }

@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod classifier;
 pub mod clone_engine;
 pub mod config;
 pub mod coverage;
@@ -58,6 +59,9 @@ pub struct RiskReport {
     pub advice: String,
     pub engine: String,
     pub loc: FileStats,
+    /// Set to Some(_) when the file was classified as generated/vendored with action=Flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_class: Option<classifier::FileClass>,
     #[serde(skip)]
     pub weights: RiskWeights,
 }
@@ -267,6 +271,7 @@ mod tests {
             advice: "".to_string(),
             engine: "test".to_string(),
             loc: FileStats::default(),
+            file_class: None,
             weights: RiskWeights::default(),
         };
 
